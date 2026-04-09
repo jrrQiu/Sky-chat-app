@@ -1,5 +1,5 @@
 // features/chat/types/chat.ts
-//为了让后续代码有极好的代码提示，我们需要定义一套消息类型
+//为了让后续代码有极好的代码提示，需要定义一套消息类型
 export type MessageRole = 'user' | 'assistant' | 'system'
 
 // 单条消息的结构

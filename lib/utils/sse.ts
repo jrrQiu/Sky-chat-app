@@ -1,5 +1,4 @@
 // lib/utils/sse.ts
-
 /**
  * 解析 SSE 行数据
  * @param line - SSE 行字符串
@@ -21,7 +20,6 @@ export function parseSSELine(line: string): string | null {
 export function splitSSEBuffer(buffer: string): { lines: string[]; remaining: string } {
   // 注意：网络流的换行符可能是 \n 也可能是 \r\n，这里统一处理
   const lines = buffer.split(/\r?\n/)
-  // 弹出最后一行作为 remaining。如果最后一行是空字符串，说明上一行正好以换行符结尾，是完整包
   const remaining = lines.pop() || ''
   return { lines, remaining }
 }
