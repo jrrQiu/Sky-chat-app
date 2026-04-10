@@ -78,18 +78,15 @@ export const ChatService = {
       // 4. 接管水管 (ReadableStream)
       const reader = response.body.getReader()
 
-      // 5. 召唤我们写的质检员 (SSEParser)，开始源源不断地解析水流
+      // 5.开始源源不断地解析水流
       await SSEParser.parseStream(reader, {
         onData: (data) => {
-          // 这个回调会被疯狂触发！
+          // 这个回调会被疯狂触发
           
           // 如果是文本增量，就追加到对应的 AI 消息后面
           if (data.type === 'text' && data.textDelta) {
             useChatStore.getState().appendContent(assistantMessageId, data.textDelta)
           }
-          
-          // 高级特性预留：如果是模型在思考（如 DeepSeek-R1 的 CoT），可以在这里处理
-          // if (data.type === 'thinking' && data.thinkingDelta) { ... }
         },
         onError: (error) => {
           console.error('流解析发生错误:', error)
@@ -98,7 +95,7 @@ export const ChatService = {
           })
         },
         onComplete: () => {
-          // 流结束了（大模型说完了）
+          // 流结束
           console.log('AI 生成完毕')
         }
       })

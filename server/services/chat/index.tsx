@@ -48,7 +48,6 @@ export async function handleChatRequest(
     // ======== 生命周期的回调钩子 ========
     onFinish: async ({ text }) => {
       // text 是大模型最终生成的完整字符串
-      
       // 异步触发持久化，把这一问一答悄悄存进数据库，不阻塞用户的流式响应
       await MessagePersister.persistCompleteTurn({
         userId,
