@@ -1,4 +1,5 @@
 // features/chat/components/ChatMessage.tsx
+'use client' 
 //单条消息组件
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
