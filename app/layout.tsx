@@ -1,6 +1,8 @@
 import { Providers } from '@/components/Providers'
-//根布局使用
-export default function RootLayout({ children }) {
+import './globals.css'
+//根布局使用 Providers
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html>
       <body>
