@@ -63,12 +63,12 @@ export class SSEParser {
         // 2. 将这批字节流解码成字符串，追加进水池 (buffer)
         const chunk = decoder.decode(value, { stream: true })
         buffer += chunk
-
+        
         // 3. 从水池里切出完整的行，剩下的残渣(remaining)放回水池等下一波
         const { lines, remaining } = splitSSEBuffer(buffer)
         buffer = remaining
-
-        // 4. 挨个解析完整的行，触发回调！
+        
+        // 4. 挨个解析完整的行，触发回调
         for (const line of lines) {
           const parsed = SSEParser.parseLine(line)
           if (parsed) callbacks.onData(parsed)
