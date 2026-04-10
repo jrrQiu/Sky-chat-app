@@ -6,7 +6,7 @@ import TextareaAutosize from 'react-textarea-autosize'
 import { SendHorizonal, Square } from 'lucide-react'
 import { useChatStore } from '@/features/chat/store/chat.store'
 import { ChatService } from '@/features/chat/services/chat.service'
-import { Button } from '@/components/ui/button' // 前面用 shadcn 生成的
+import { Button } from '@/components/ui/button' 
 
 interface ChatInputProps {
   conversationId?: string
@@ -30,7 +30,7 @@ export function ChatInput({ conversationId }: ChatInputProps) {
   const handleSubmit = () => {
     if (!input.trim() || isSendingMessage) return
     
-    // 调用我们在上一节写好的 ChatService！
+    // 调用ChatService发送消息方法
     ChatService.sendMessage(input.trim(), conversationId)
     setInput('') // 清空输入框
   }
