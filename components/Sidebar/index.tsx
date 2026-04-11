@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useUIStore } from '@/lib/stores/ui.store'
 import { useRouter } from 'next/navigation'
+import { NewChatButton } from '@/features/conversation/components/NewChatButton'
 
 interface SidebarProps {
   children?: React.ReactNode // 里面会放历史会话列表
@@ -41,14 +42,7 @@ export function Sidebar({ children }: SidebarProps) {
 
       {/* 新建对话按钮 */}
       <div className="px-3 pb-3">
-        <Button 
-          variant="outline" 
-          className={`w-full justify-start ${collapsed ? 'px-0 justify-center' : ''}`}
-          onClick={() => router.push('/')}
-        >
-          <Plus className={`h-4 w-4 ${collapsed ? '' : 'mr-2'}`} />
-          {!collapsed && '新对话'}
-        </Button>
+        <NewChatButton /> {/* <--- 替换掉原来写死的 <Button> */}
       </div>
 
       {/* 中间：历史会话列表区域 */}

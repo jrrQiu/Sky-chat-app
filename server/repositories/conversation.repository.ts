@@ -44,4 +44,38 @@ export const ConversationRepository = {
       ],
     })
   },
+  /**
+   * 更新会话标题
+   */
+  async updateTitle(id: string, userId: string, title: string) {
+    const result = await prisma.conversation.updateMany({
+      where: { id, userId },
+      data: { title, updatedAt: new Date() },
+    })
+    return result.count > 0
+  },
+
+  /**
+   * 删除会话
+   */
+  async delete(id: string, userId: string) {
+    const result = await prisma.conversation.deleteMany({
+      where: { id, userId },
+    })
+    return result.count > 0
+  },
+
+  /**
+   * 置顶/取消置顶会话
+   */
+  async togglePin(id: string, userId: string, isPinned: boolean) {
+    const result = await prisma.conversation.updateMany({
+      where: { id, userId },
+      data: {
+        isPinned,
+        pinnedAt: isPinned ? new Date() : null,
+      },
+    })
+    return result.count > 0
+  },
 }
