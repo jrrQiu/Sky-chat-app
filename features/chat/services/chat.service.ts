@@ -3,6 +3,8 @@ import { nanoid } from 'nanoid'
 import { useChatStore } from '../store/chat.store'
 import { SSEParser } from '../utils/sse-parser'
 import type { Message } from '../types/chat'
+import { useConversationStore } from '@/features/conversation/store/conversation-store'
+
 
 // 用于保存当前请求的控制器，方便用户中途点击“停止生成”
 let streamAbortController: AbortController | null = null
@@ -59,13 +61,17 @@ export const ChatService = {
     try {
       // 3. 向我们写的后端 API 发起请求
       // 取出当前的所有历史消息作为上下文发给大模型
+      // 注意：不能把最后一条空的 assistant 消息发给大模型，否则会被认为最新消息为空！
       const currentMessages = useChatStore.getState().messages
+      const messagesToSend = currentMessages
+        .filter(m => m.id !== assistantMessageId) // 过滤掉刚刚占位的空 AI 消息
+        .map(m => ({ role: m.role, content: m.content }))
       
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: currentMessages.map(m => ({ role: m.role, content: m.content })),
+          messages: messagesToSend,
           conversationId,
         }),
         signal: streamAbortController.signal,
@@ -95,8 +101,17 @@ export const ChatService = {
           })
         },
         onComplete: () => {
-          // 流结束
           console.log('AI 生成完毕')
+          // ======== 新增：刷新侧边栏标题 ========
+          // 如果当前会话里只有一条用户消息和一条AI消息，说明是首聊结束
+          const store = useChatStore.getState()
+          if (store.messages.length <= 2) {
+            // 等待一两秒钟，给后端大模型生成标题留点时间
+            setTimeout(() => {
+              useConversationStore.getState().loadConversations()
+            }, 2000)
+          }
+          // ===================================
         }
       })
 
