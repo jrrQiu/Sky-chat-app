@@ -34,4 +34,14 @@ export const ConversationRepository = {
       data,
     })
   },
+
+  async findByUserId(userId: string) {
+    return prisma.conversation.findMany({
+      where: { userId },
+      orderBy: [
+        { isPinned: 'desc' },  // 置顶的排前面
+        { updatedAt: 'desc' }, // 最近聊过的排前面
+      ],
+    })
+  },
 }
