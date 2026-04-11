@@ -1,24 +1,36 @@
 // app/chat/[conversationId]/page.tsx
+
+import { useEffect } from 'react'
 import { MessageList } from '@/features/chat/components/MessageList'
 import { ChatInput } from '@/features/chat/components/ChatInput'
 import { AuthGuard } from '@/features/auth/components/AuthGuard'
 import { MainLayout } from '@/components/MainLayout'
+import { ConversationList } from '@/features/conversation/components/ConversationList' 
+import { ChatService } from '@/features/chat/services/chat.service' // 引入服务
+import { useChatStore } from '@/features/chat/store/chat.store'     // 引入状态
 
 export default function ChatPage({ params }: { params: { conversationId: string } }) {
   // 从 URL 参数中拿到当前的历史会话 ID
   const { conversationId } = params
+  // 引入清空消息的方法
+  const clearMessages = useChatStore((s) => s.clearMessages)
 
+  // 当 URL 里的 conversationId 发生变化时，立刻拉取新的历史记录
+  useEffect(() => {
+    if (conversationId) {
+      ChatService.loadMessages(conversationId)
+    }
+    
+    // 卸载组件时（比如切回首页新对话），清空当前聊天框，防止数据串台
+    return () => {
+      clearMessages()
+    }
+  }, [conversationId, clearMessages])
   return (
     <AuthGuard>
-      <MainLayout 
-        sidebarChildren={
-          <div className="text-sm text-gray-500 text-center mt-10">
-            暂无历史会话
-          </div>
-        }
-      >
+      <MainLayout sidebarChildren={<ConversationList />}>
         <header className="flex h-14 items-center justify-center border-b border-gray-100 dark:border-gray-800">
-          <h1 className="text-lg font-semibold">历史会话：{conversationId}</h1>
+          <h1 className="text-lg font-semibold text-gray-500 text-sm">会话 ID: {conversationId}</h1>
         </header>
 
         <MessageList />

@@ -116,5 +116,37 @@ export const ChatService = {
       store.stopStreaming()
       streamAbortController = null
     }
-  }
+  },
+
+  /**
+   * 加载指定会话的历史消息
+   */
+  async loadMessages(conversationId: string) {
+    const store = useChatStore.getState()
+    
+    // 如果正在发消息，为了防止状态混乱，先跳过加载
+    if (store.isSendingMessage) return
+
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/messages`)
+      
+      if (!response.ok) {
+        if (response.status === 404) {
+          console.warn('该会话不存在或已被删除')
+          // 可选：重定向回首页
+          // window.location.href = '/'
+        }
+        return
+      }
+
+      const data = await response.json()
+      
+      if (data.messages) {
+        // 直接用后端的全量历史消息，覆盖掉当前 Zustand store 里的消息数组！
+        store.setMessages(data.messages)
+      }
+    } catch (error) {
+      console.error('加载历史消息失败:', error)
+    }
+  },
 }
