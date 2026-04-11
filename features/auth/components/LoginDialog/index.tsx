@@ -32,7 +32,6 @@ export function LoginDialog({ open }: LoginDialogProps) {
             className="w-full bg-[#24292F] text-white hover:bg-[#24292F]/90 hover:text-white"
             onClick={handleGithubLogin}
           >
-            <Github className="mr-2 h-5 w-5" />
             使用 GitHub 账号登录
           </Button>
           
