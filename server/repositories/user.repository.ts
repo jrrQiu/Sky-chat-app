@@ -14,7 +14,7 @@ export class UserRepository {
         name: true,
         email: true,
         image: true,
-        apiKey: true, // 核心：获取用户自定义的大模型 API Key
+        // apiKey: true, // 核心：获取用户自定义的大模型 API Key
       },
     })
   }

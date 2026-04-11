@@ -28,6 +28,7 @@ export async function POST(req: Request) {
   // 优先使用用户自己填写的 API Key，如果没有，降级使用环境变量里的系统 Key
   const apiKey = user.apiKey || process.env.SILICONFLOW_API_KEY || process.env.OPENAI_API_KEY
   if (!apiKey) {
+     console.error('【400 错误】: 未配置 API Key')
     return Response.json(
       { error: '未配置 API Key。请在个人资料中设置您的 SiliconFlow API Key，或联系管理员。' },
       { status: 400 }
@@ -40,6 +41,7 @@ export async function POST(req: Request) {
   // 取出最新的一条消息，校验是否为空
   const latestMessageContent = body.messages?.[body.messages.length - 1]?.content
   if (!latestMessageContent?.trim()) {
+    console.error('【400 错误】: 消息内容为空，前端发来的数据是:', JSON.stringify(body))
     return Response.json({ error: '消息内容不能为空' }, { status: 400 })
   }
 
