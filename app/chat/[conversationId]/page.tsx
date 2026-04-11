@@ -1,6 +1,7 @@
 // app/chat/[conversationId]/page.tsx
+'use client'
 
-import { useEffect } from 'react'
+import { useEffect,use } from 'react'
 import { MessageList } from '@/features/chat/components/MessageList'
 import { ChatInput } from '@/features/chat/components/ChatInput'
 import { AuthGuard } from '@/features/auth/components/AuthGuard'
@@ -9,9 +10,11 @@ import { ConversationList } from '@/features/conversation/components/Conversatio
 import { ChatService } from '@/features/chat/services/chat.service' // 引入服务
 import { useChatStore } from '@/features/chat/store/chat.store'     // 引入状态
 
-export default function ChatPage({ params }: { params: { conversationId: string } }) {
-  // 从 URL 参数中拿到当前的历史会话 ID
-  const { conversationId } = params
+export default function ChatPage({ params }: { params: Promise<{ conversationId: string }> }) {
+  // 3. 使用 React.use() 来解包这个 Promise，拿到里面的真实数据
+  const resolvedParams = use(params)
+  const conversationId = resolvedParams.conversationId
+
   // 引入清空消息的方法
   const clearMessages = useChatStore((s) => s.clearMessages)
 
