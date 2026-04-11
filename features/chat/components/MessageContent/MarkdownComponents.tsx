@@ -16,7 +16,7 @@ export function createMarkdownComponents(): Components {
       )
     },
     
-    // 我们还可以劫持 <a> 标签，让聊天里生成的链接全都在新标签页打开
+    // 劫持 <a> 标签，让聊天里生成的链接全都在新标签页打开
     a: ({ href, children }) => (
       <a
         href={href}
