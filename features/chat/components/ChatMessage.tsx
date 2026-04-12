@@ -7,7 +7,7 @@ import rehypeHighlight from 'rehype-highlight'
 // 引入 Github 风格的代码高亮 CSS
 import 'highlight.js/styles/github-dark.css' 
 import { ThinkingPanel } from './ThinkingPanel'
-
+import { MessageActions } from './MessageActions'
 import type { Message } from '@/features/chat/types/chat'
 import { useChatStore } from '@/features/chat/store/chat.store'
 import { createMarkdownComponents } from './MessageContent/MarkdownComponents'
@@ -55,6 +55,18 @@ export function ChatMessage({ message }: { message: Message }) {
           <span className="inline-block h-4 w-1.5 ml-1 animate-pulse bg-black align-middle dark:bg-white" />
         )}
       </div>
+      {/* ======== 新增：将操作栏放在气泡外面，跟气泡并列 ======== */}
+      <div className={`absolute bottom-0 ${isUser ? 'right-0' : 'left-0'} mb-1`}>
+        {/* 只有当这条消息已经生成完毕时，才显示操作栏 */}
+        {!isStreamingContent && !isStreamingThinking && (
+          <MessageActions 
+            messageId={message.id} 
+            content={message.content} 
+            role={message.role} 
+          />
+        )}
+      </div>
+      {/* ======================================================== */}
     </div>
   )
 }
