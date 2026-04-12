@@ -47,6 +47,9 @@ interface ChatActions {
   
   // 切换模型
   setModel: (modelId: string) => void
+
+  // 新增：流式传输专用：往某条消息的思考过程末尾拼接新字
+  appendThinking: (id: string, chunk: string) => void
 }
 
 // 结合 State 和 Actions，创建最终的 Store
@@ -76,6 +79,15 @@ export const useChatStore = create<ChatState & ChatActions>((set) => ({
     set((state) => ({
       messages: state.messages.map((msg) =>
         msg.id === id ? { ...msg, content: msg.content + chunk } : msg
+      ),
+    })),
+    
+  appendThinking: (id, chunk) =>
+    set((state) => ({
+      messages: state.messages.map((msg) =>
+        msg.id === id 
+          ? { ...msg, thinking: (msg.thinking || '') + chunk } 
+          : msg
       ),
     })),
 

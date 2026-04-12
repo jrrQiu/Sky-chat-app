@@ -7,6 +7,7 @@ export interface Message {
   id: string
   role: MessageRole
   content: string
+  thinking?: string
   conversationId?: string
   createdAt?: number
   // 预留给未来多模态扩展的字段

@@ -87,13 +87,17 @@ export const ChatService = {
 
       // 5.开始源源不断地解析水流
       await SSEParser.parseStream(reader, {
-        onData: (data) => {
-          // 这个回调会被疯狂触发
-          
-          // 如果是文本增量，就追加到对应的 AI 消息后面
-          if (data.type === 'text' && data.textDelta) {
+         onData: (data) => {
+          // ======== 新增：拦截思考过程 ========
+          // 如果后端返回的 data 包含 thinkingDelta 字段，就塞给思考过程！
+          if (data.type === 'text-delta' && data.thinkingDelta) {
+            useChatStore.getState().appendThinking(assistantMessageId, data.thinkingDelta)
+          } 
+          // 否则就是正常的文本，塞给正文！
+          else if (data.type === 'text-delta' && data.textDelta) {
             useChatStore.getState().appendContent(assistantMessageId, data.textDelta)
           }
+          // ====================================
         },
         onError: (error) => {
           console.error('流解析发生错误:', error)

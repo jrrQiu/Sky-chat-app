@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 // 引入 Github 风格的代码高亮 CSS
 import 'highlight.js/styles/github-dark.css' 
+import { ThinkingPanel } from './ThinkingPanel'
 
 import type { Message } from '@/features/chat/types/chat'
 import { useChatStore } from '@/features/chat/store/chat.store'
@@ -15,7 +16,10 @@ export function ChatMessage({ message }: { message: Message }) {
   const isUser = message.role === 'user'
   const streamingMessageId = useChatStore(s => s.streamingMessageId)
   const isStreaming = message.id === streamingMessageId
-
+  // 只有当这条消息正在流式输出，并且大模型还没开始写正文（正在思考阶段）时，光标才在思考区闪烁
+  const isStreamingThinking = message.id === streamingMessageId && !message.content
+  // 只有当大模型开始写正文了，光标才在正文区闪烁
+  const isStreamingContent = message.id === streamingMessageId && !!message.content
   // 获取我们刚刚配置好的劫持组件
   const components = createMarkdownComponents()
 
@@ -29,6 +33,9 @@ export function ChatMessage({ message }: { message: Message }) {
           }
         `}
       >
+        {/* ======== 新增：思考面板渲染在这里！ ======== */}
+        {!isUser && <ThinkingPanel messageId={message.id} />}
+
         <div className={`prose prose-sm max-w-none break-words ${isUser ? 'prose-invert' : 'dark:prose-invert'}`}>
           <ReactMarkdown 
             // 插件 1：支持表格、删除线、自动链接
@@ -43,7 +50,8 @@ export function ChatMessage({ message }: { message: Message }) {
         </div>
 
         {/* 流式光标 */}
-        {isStreaming && (
+        {/* 只有在输出正文时，才显示黑色闪烁光标 */}
+        {isStreamingContent && (
           <span className="inline-block h-4 w-1.5 ml-1 animate-pulse bg-black align-middle dark:bg-white" />
         )}
       </div>
