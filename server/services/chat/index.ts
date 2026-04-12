@@ -5,6 +5,7 @@ import { nanoid } from 'nanoid'
 import { MessagePersister } from './message-persister'
 import { generateText } from 'ai'
 import { ConversationRepository } from '@/server/repositories/conversation.repository'
+import { searchWeb } from '../tools/web-search' // 引入搜索工具
 
 // 定义自定义错误类
 export class NotFoundError extends Error {
@@ -22,7 +23,7 @@ export async function handleChatRequest(
   apiKey: string,
   body: any // 这里后续可以定义严格的 TS 接口
 ) {
-  const { messages, conversationId: reqConversationId, model } = body
+  const { messages, conversationId: reqConversationId, model, enableWebSearch } = body
 
   // 1. 初始化模型客户端
   // Sky-Chat 默认使用的是 SiliconFlow 提供的接口（兼容 OpenAI 格式）
@@ -39,6 +40,24 @@ export async function handleChatRequest(
   // 提取用户发来的最新一条消息内容
   const latestUserMessage = messages[messages.length - 1].content
   const conversationTitle = '新对话'
+
+  
+  // ======== 核心魔法：RAG 检索增强生成 ========
+  let searchContext = ''
+  if (enableWebSearch) {
+    console.log(`[WebSearch] 正在为问题 "${latestUserMessage}" 检索全网资料...`)
+    const searchResults = await searchWeb(latestUserMessage)
+    
+  // 把搜到的资料拼装成一段话
+    searchContext = `
+    =========================
+    【实时背景知识库】
+    ${searchResults}
+    =========================
+    请结合上面的最新资料，回答用户的最新问题。如果你在回答中引用了资料，请在句末标注来源序号（如 [1]）。
+    `
+  }
+  // ===========================================
 
   // 3. 调用模型生成流式文本
   // 注意：这里使用的是 Vercel AI SDK 提供的 streamText 方法
