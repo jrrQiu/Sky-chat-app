@@ -22,7 +22,7 @@ export async function handleChatRequest(
   apiKey: string,
   body: any // 这里后续可以定义严格的 TS 接口
 ) {
-  const { messages, conversationId: reqConversationId } = body
+  const { messages, conversationId: reqConversationId, model } = body
 
   // 1. 初始化模型客户端
   // Sky-Chat 默认使用的是 SiliconFlow 提供的接口（兼容 OpenAI 格式）
@@ -43,7 +43,7 @@ export async function handleChatRequest(
   // 3. 调用模型生成流式文本
   // 注意：这里使用的是 Vercel AI SDK 提供的 streamText 方法
   const result = await streamText({
-    model: siliconflow('meta-llama/llama-3.2-3b-instruct:free'), // 指定大模型
+    model: siliconflow(model || 'meta-llama/llama-3.2-3b-instruct:free'), // 指定大模型
     messages: messages,
     temperature: 0.7,
         // ======== 给大模型的最高指令 ========
