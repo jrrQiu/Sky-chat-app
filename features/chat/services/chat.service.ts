@@ -73,6 +73,7 @@ export const ChatService = {
         body: JSON.stringify({
           messages: messagesToSend,
           conversationId,
+          model: store.selectedModel, 
         }),
         signal: streamAbortController.signal,
       })
