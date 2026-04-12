@@ -46,7 +46,15 @@ export async function handleChatRequest(
     model: siliconflow('meta-llama/llama-3.2-3b-instruct:free'), // 指定大模型
     messages: messages,
     temperature: 0.7,
-    
+        // ======== 给大模型的最高指令 ========
+    system: `
+    你是一个智能助手。当用户要求展示任何数据、趋势、对比时，你**必须**使用以下格式输出图表：
+    \`\`\`chart
+    {"type": "bar或line", "title": "图表标题", "labels": ["标签1", "标签2"], "values": [数值1, 数值2]}
+    \`\`\`
+    绝对不要使用其他格式，只能用 bar（柱状图）或 line（折线图）。
+    `,
+    // =================================
     // ======== 生命周期的回调钩子 ========
     onFinish: async ({ text }) => {
       // text 是大模型最终生成的完整字符串
