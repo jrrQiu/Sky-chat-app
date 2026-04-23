@@ -7,7 +7,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { useUIStore } from '@/lib/stores/ui.store'
 import { useRouter } from 'next/navigation'
 import { NewChatButton } from '@/features/conversation/components/NewChatButton'
-
+import { ThemeToggle } from '@/components/ThemeToggle'
 interface SidebarProps {
   children?: React.ReactNode // 里面会放历史会话列表
 }
@@ -51,7 +51,13 @@ export function Sidebar({ children }: SidebarProps) {
           {children}
         </ScrollArea>
       )}
-      
+      {/* 底部：主题切换 */}
+      <div className="mt-auto p-4 border-t border-gray-200 dark:border-gray-800">
+        <div className={collapsed ? "flex justify-center" : "flex items-center px-2"}>
+          <ThemeToggle />
+          {!collapsed && <span className="ml-2 text-sm text-gray-600 dark:text-gray-400">切换主题</span>}
+        </div>
+      </div>
       {/* 底部预留：可以放用户头像、设置等 */}
     </aside>
   )

@@ -1,10 +1,9 @@
 import { Providers } from '@/components/Providers'
 import './globals.css'
-//根布局使用 Providers
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html>
+    <html lang="zh-CN" suppressHydrationWarning>
       <body>
         <Providers>
           {children}

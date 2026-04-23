@@ -17,6 +17,9 @@ interface ChatState {
   
   // 选中的大模型
   selectedModel: string
+
+  enableThinking: boolean
+  enableWebSearch: boolean
 }
 
 // 定义可以怎么修改这些数据（动作）
@@ -50,6 +53,9 @@ interface ChatActions {
 
   // 新增：流式传输专用：往某条消息的思考过程末尾拼接新字
   appendThinking: (id: string, chunk: string) => void
+
+  toggleThinking: (enabled: boolean) => void
+  toggleWebSearch: (enabled: boolean) => void
 }
 
 // 结合 State 和 Actions，创建最终的 Store
@@ -59,7 +65,8 @@ export const useChatStore = create<ChatState & ChatActions>((set) => ({
   isSendingMessage: false,
   streamingMessageId: null,
   selectedModel: 'deepseek-ai/DeepSeek-V3',
-
+  enableThinking: false,
+  enableWebSearch: false,
   // === 动作实现 ===
   
   setMessages: (messages) => set({ messages }),
@@ -100,4 +107,7 @@ export const useChatStore = create<ChatState & ChatActions>((set) => ({
   stopStreaming: () => set({ streamingMessageId: null }),
   
   setModel: (modelId) => set({ selectedModel: modelId }),
+
+  toggleThinking: (enabled) => set({ enableThinking: enabled }),
+  toggleWebSearch: (enabled) => set({ enableWebSearch: enabled }),
 }))

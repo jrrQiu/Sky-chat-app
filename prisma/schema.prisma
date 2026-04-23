@@ -44,7 +44,7 @@ model Account {
   @@unique([provider, providerAccountId])
 }
 
-// 会话表
+
 model Session {
   id           String   @id @default(cuid())
   sessionToken String   @unique
@@ -53,6 +53,7 @@ model Session {
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
+// 会话表
 model Conversation {
   id       String    @id @default(cuid())
   title    String
