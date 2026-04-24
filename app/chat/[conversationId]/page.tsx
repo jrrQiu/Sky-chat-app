@@ -1,34 +1,50 @@
 // app/chat/[conversationId]/page.tsx
 'use client'
 
-import { useEffect,use } from 'react'
+import { useEffect, use, useRef } from 'react'
+import { useSearchParams, useRouter } from 'next/navigation'
 import { MessageList } from '@/features/chat/components/MessageList'
 import { ChatInput } from '@/features/chat/components/ChatInput'
 import { AuthGuard } from '@/features/auth/components/AuthGuard'
 import { MainLayout } from '@/components/MainLayout'
 import { ConversationList } from '@/features/conversation/components/ConversationList' 
-import { ChatService } from '@/features/chat/services/chat.service' // 引入服务
-import { useChatStore } from '@/features/chat/store/chat.store'     // 引入状态
+import { ChatService } from '@/features/chat/services/chat.service'
+import { useChatStore } from '@/features/chat/store/chat.store'
 
 export default function ChatPage({ params }: { params: Promise<{ conversationId: string }> }) {
-  // 3. 使用 React.use() 来解包这个 Promise，拿到里面的真实数据
   const resolvedParams = use(params)
   const conversationId = resolvedParams.conversationId
-
-  // 引入清空消息的方法
+  
+  const searchParams = useSearchParams()
+  const router = useRouter()
   const clearMessages = useChatStore((s) => s.clearMessages)
+  
+  // 防止在 React StrictMode 下发送两次
+  const hasAutoSentRef = useRef(false)
 
-  // 当 URL 里的 conversationId 发生变化时，立刻拉取新的历史记录
   useEffect(() => {
     if (conversationId) {
       ChatService.loadMessages(conversationId)
+      
+      // 【新增逻辑】检查是否有携带的初始消息需要自动发送
+      const pendingMsg = searchParams.get('msg')
+      if (pendingMsg && !hasAutoSentRef.current) {
+        hasAutoSentRef.current = true
+        
+        // 延迟一丢丢发送，确保 UI 和历史记录（如果有）先加载完毕
+        setTimeout(() => {
+          ChatService.sendMessage(pendingMsg, conversationId)
+          // 发送完后，把 URL 上的参数清理掉，避免刷新页面再次发送
+          router.replace(`/chat/${conversationId}`)
+        }, 300)
+      }
     }
     
-    // 卸载组件时（比如切回首页新对话），清空当前聊天框，防止数据串台
     return () => {
       clearMessages()
     }
-  }, [conversationId, clearMessages])
+  }, [conversationId, clearMessages, searchParams, router])
+
   return (
     <AuthGuard>
       <MainLayout sidebarChildren={<ConversationList />}>
@@ -39,7 +55,6 @@ export default function ChatPage({ params }: { params: Promise<{ conversationId:
         <MessageList />
 
         <div className="w-full bg-gradient-to-t from-white via-white to-transparent pb-4 pt-2 dark:from-gray-900 dark:via-gray-900">
-          {/* 把 conversationId 传给输入框，这样发消息时后端就知道属于哪个会话了！ */}
           <ChatInput conversationId={conversationId} />
         </div>
       </MainLayout>

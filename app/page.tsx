@@ -1,30 +1,6 @@
 // app/page.tsx
-import { MessageList } from '@/features/chat/components/MessageList'
-import { ChatInput } from '@/features/chat/components/ChatInput'
-import { AuthGuard } from '@/features/auth/components/AuthGuard'
-import { MainLayout } from '@/components/MainLayout'
+import { LandingPage } from '@/components/LandingPage'
 
-export default function Home() {
-  return (
-    <AuthGuard>
-      <MainLayout 
-        sidebarChildren={
-          <div className="text-sm text-gray-500 text-center mt-10">
-            暂无历史会话
-          </div>
-        }
-      >
-        {/* 聊天区主内容 */}
-        <header className="flex h-14 items-center justify-center border-b border-gray-100 dark:border-gray-800">
-          <h1 className="text-lg font-semibold">新对话</h1>
-        </header>
-
-        <MessageList />
-
-        <div className="w-full bg-gradient-to-t from-white via-white to-transparent pb-4 pt-2 dark:from-gray-900 dark:via-gray-900">
-          <ChatInput />
-        </div>
-      </MainLayout>
-    </AuthGuard>
-  )
+export default function HomePage() {
+  return <LandingPage />
 }
