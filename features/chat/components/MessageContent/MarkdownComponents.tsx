@@ -3,21 +3,21 @@ import { CodeBlock } from './CodeBlock'
 import type { Components } from 'react-markdown'
 import { ChartBlock } from './blocks/ChartBlock' // 引入图表块
 
-export function createMarkdownComponents(isStreaming: boolean = false): Components {
+export function createMarkdownComponents(
+  isStreaming: boolean = false,
+  disableMediaBlocks: boolean = false
+): Components {
   return {
     // 劫持所有的 <code> 标签
-     code: ({ className, children }) => {
+    code: ({ className, children, ...props }) => {
       const match = /language-(\w+)/.exec(className || '')
       const language = match?.[1] || ''
       const content = String(children).replace(/\n$/, '')
 
-      // ======== 魔法拦截区 ========
-      // 如果大模型吐出的是 ```chart ... ```
-      if (language === 'chart') {
+      // 如果未禁用媒体块且大模型吐出的是 chart
+      if (!disableMediaBlocks && language === 'chart') {
         return <ChartBlock data={content} isStreaming={isStreaming} />
       }
-      // 这里还可以无限扩展：比如 language === 'weather' 就渲染天气组件！
-      // ============================
 
       const isInline = !className
       return (

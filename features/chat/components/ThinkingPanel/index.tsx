@@ -1,70 +1,101 @@
-// features/chat/components/ThinkingPanel/index.tsx
 'use client'
+
+/**
+ * Thinking Panel Component - 思考过程面板
+ * 
+ * 独立的可折叠面板，用于显示 AI 的推理过程
+ * 通过 messageId 订阅 Store，数据驱动 UI
+ * 
+ * @module components/ThinkingPanel
+ */
 
 import { useState, useRef, useEffect } from 'react'
 import { ChevronDown, Brain } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { MessageContent } from '@/features/chat/components/MessageContent'
 import { useChatStore } from '@/features/chat/store/chat.store'
+import { selectMessagePhase, selectPhaseLabel, selectIsProcessing } from '@/features/chat/store/selectors'
 
 interface ThinkingPanelProps {
+  /** 消息 ID */
   messageId: string
+  /** 默认是否展开 */
+  defaultExpanded?: boolean
 }
 
-export function ThinkingPanel({ messageId }: ThinkingPanelProps) {
-  // 从 Store 获取这条消息的思考内容
-  const message = useChatStore((s) => s.messages.find(m => m.id === messageId))
-  const isStreaming = useChatStore((s) => s.streamingMessageId === messageId)
-  
-  const content = message?.thinking || ''
-  
-  // 只有当有思考内容时才渲染
-  const [isExpanded, setIsExpanded] = useState(true)
+/**
+ * 思考过程面板组件
+ * 
+ * 显示 AI 的推理过程，支持折叠/展开
+ */
+export function ThinkingPanel({
+  messageId,
+  defaultExpanded = true,
+}: ThinkingPanelProps) {
+  const [isExpanded, setIsExpanded] = useState(defaultExpanded)
   const contentRef = useRef<HTMLDivElement>(null)
-
-  // 当正在思考时，如果内容超长，自动滚动到底部
+  
+  // 从 Store 订阅状态
+  const phase = useChatStore(selectMessagePhase(messageId))
+  const label = useChatStore(selectPhaseLabel(messageId))
+  const isProcessing = useChatStore(selectIsProcessing(messageId))
+  const content = useChatStore((s) => s.messages.find(m => m.id === messageId)?.thinking ?? '')
+  
+  // 计算是否正在流式传输
+  const isStreaming = isProcessing && (phase === 'thinking' || phase === 'tool_calling')
+  
+  // 自动滚动到底部 - 当内容更新且正在流式传输时
   useEffect(() => {
     if (isStreaming && isExpanded && contentRef.current) {
       contentRef.current.scrollTop = contentRef.current.scrollHeight
     }
   }, [content, isStreaming, isExpanded])
-
-  // 如果这段消息完全没有思考内容，直接不渲染
+  
+  // 如果没有内容，不渲染
   if (!content) return null
-
-  // 只要大模型开始输出正文（content有值了），说明思考结束了
-  const isThinkingFinished = !!message?.content
-
+  
   return (
-    <div className="mb-4 overflow-hidden rounded-xl border border-gray-200/50 bg-gray-50/50 dark:border-gray-800/50 dark:bg-gray-900/30 transition-all duration-300">
-      
-      {/* 顶部可点击的折叠栏 */}
+    <div className="mb-4 border border-border/30 bg-muted/10 dark:bg-gray-900/30 rounded-xl overflow-hidden transition-all duration-300">
+      {/* 可折叠的标题栏 */}
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className="flex w-full items-center justify-between px-4 py-2.5 hover:bg-gray-100/50 dark:hover:bg-gray-800/50 transition-colors group outline-none"
+        className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-muted/20 dark:hover:bg-gray-800/30 transition-colors duration-200 group"
+        aria-expanded={isExpanded}
+        aria-label={isExpanded ? '折叠思考过程' : '展开思考过程'}
       >
         <div className="flex items-center gap-2.5">
-          <Brain className={`h-4 w-4 ${!isThinkingFinished ? 'text-blue-500 animate-pulse' : 'text-gray-400'}`} />
-          <span className="text-sm font-medium text-gray-600 dark:text-gray-300">
-            {!isThinkingFinished ? '深度思考中...' : '已完成思考'}
+          <Brain className="h-4 w-4 text-muted-foreground dark:text-gray-400" />
+          <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+            {label}
           </span>
+          {/* 流式传输指示器 */}
+          {isStreaming && (
+            <span 
+              className="inline-flex h-2 w-2 rounded-full bg-muted-foreground animate-pulse"
+              aria-label="正在思考"
+            />
+          )}
         </div>
-        <ChevronDown 
-          className={`h-4 w-4 text-gray-400 transition-transform duration-300 ${isExpanded ? 'rotate-180' : ''}`} 
-        />
+        {/* 折叠图标 - 带旋转动画 */}
+        <ChevronDown className={`h-4 w-4 text-gray-500 dark:text-gray-400 group-hover:text-gray-700 dark:group-hover:text-gray-200 transition-all duration-300 ${isExpanded ? 'rotate-180' : 'rotate-0'}`} />
       </button>
-
-      {/* 折叠的内容区 */}
+      
+      {/* 可折叠的内容区域 - 带动画过渡 */}
       <div 
-        className={`transition-all duration-300 ease-in-out ${isExpanded ? 'max-h-[400px] opacity-100' : 'max-h-0 opacity-0'}`}
+        className={`transition-all duration-200 ease-out ${
+          isExpanded ? 'max-h-[500px] opacity-100' : 'max-h-0 opacity-0'
+        }`}
       >
         <div 
           ref={contentRef}
-          className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400 overflow-y-auto max-h-[400px] prose prose-sm dark:prose-invert"
+          className={`px-4 py-3 overflow-y-auto ${isExpanded ? 'max-h-[500px]' : 'h-0'}`}
         >
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-            {content}
-          </ReactMarkdown>
+      {isExpanded && (
+          <MessageContent
+            content={content}
+            isStreaming={isStreaming}
+            disableMediaBlocks={true}
+          />
+          )}
         </div>
       </div>
     </div>

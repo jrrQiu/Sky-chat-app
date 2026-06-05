@@ -11,8 +11,8 @@ export function LandingInput() {
   const [showLogin, setShowLogin] = useState(false)
 
   const handleSend = useCallback(() => {
-    if (!message.trim()) return
-    // 点击发送时，弹出登录框
+    const trimmedMessage = message.trim()
+    if (!trimmedMessage) return
     setShowLogin(true)
   }, [message])
 
@@ -48,9 +48,15 @@ export function LandingInput() {
       <p className="text-center text-sm text-gray-500 dark:text-gray-400 mt-6">
         点击发送后，您需要登录或注册账号
       </p>
-
-      {/* 登录对话框 */}
-      <LoginDialog open={showLogin} />
+      
+      <LoginDialog 
+        open={showLogin} 
+        onOpenChange={setShowLogin}
+        onSuccess={() => {
+          const encodedMsg = encodeURIComponent(message.trim())
+          window.location.href = `/chat?msg=${encodedMsg}`
+        }}
+      />
     </>
   )
 }
