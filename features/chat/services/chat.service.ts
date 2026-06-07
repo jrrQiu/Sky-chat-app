@@ -1,172 +1,493 @@
-// features/chat/services/chat.service.ts
+/**
+ * Chat Service - 业务逻辑
+ *
+ * 处理消息发送、加载、流式解析等
+ * 不依赖 React，纯业务逻辑
+ */
+
 import { nanoid } from 'nanoid'
-import { useChatStore } from '../store/chat.store'
-import { SSEParser } from '../utils/sse-parser'
-import type { Message } from '../types/chat'
-import { useConversationStore } from '@/features/conversation/store/conversation-store'
+import { useChatStore } from '@/features/chat/store/chat.store'
+import { SSEParser } from '@/features/chat/utils/sse-parser'
+import type { Message, FileAttachment } from '@/features/chat/types/chat'
 
+// 用于流缓冲更新的类（原版 StreamBuffer 逻辑内联简化，避免依赖缺失）
+class StreamBuffer {
+  private buffer: string = ''
+  private timer: NodeJS.Timeout | null = null
+  private onFlush: (content: string) => void
 
-// 用于保存当前请求的控制器，方便用户中途点击“停止生成”
+  constructor({ onFlush }: { onFlush: (content: string) => void }) {
+    this.onFlush = onFlush
+  }
+
+  append(chunk: string) {
+    this.buffer += chunk
+    if (!this.timer) {
+      this.timer = setTimeout(() => this.flush(), 30) // 30ms 节流更新
+    }
+  }
+
+  flush() {
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = null
+    }
+    if (this.buffer.length > 0) {
+      this.onFlush(this.buffer)
+      this.buffer = ''
+    }
+  }
+
+  forceFlush() {
+    this.flush()
+  }
+
+  destroy() {
+    if (this.timer) clearTimeout(this.timer)
+    this.buffer = ''
+  }
+}
+
+// 用于取消请求
+let loadAbortController: AbortController | null = null
 let streamAbortController: AbortController | null = null
 
 export const ChatService = {
   /**
-   * 中断当前正在生成的流
+   * 中断当前流式请求
    */
-  abortStream() {
+  abortStream(): void {
     if (streamAbortController) {
       streamAbortController.abort()
       streamAbortController = null
     }
-    useChatStore.getState().stopStreaming()
+    
+    // 更新状态机：将当前流式消息的状态转为 idle
+    const store = useChatStore.getState()
+    const messageId = store.streamingMessageId
+    if (messageId) {
+      // 取消所有正在运行的工具
+      const messageState = store.messageStates.get(messageId)
+      if (messageState) {
+        for (const [toolCallId, tool] of messageState.activeTools) {
+          if (tool.state === 'running') {
+            store.cancelTool(messageId, toolCallId)
+            // 通知后端取消工具（这里暂不强求后端一定存在）
+            fetch('/api/chat/cancel-tool', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ toolCallId }),
+            }).catch(() => {})
+          }
+        }
+      }
+      
+      // 状态机转到 idle
+      store.transitionPhase(messageId, { type: 'COMPLETE' })
+      store.updateMessage(messageId, { displayState: 'idle' })
+    }
   },
 
   /**
-   * 发送消息并处理流式响应
+   * 取消指定工具的执行
    */
-  async sendMessage(content: string, conversationId?: string) {
+  async cancelTool(messageId: string, toolCallId: string, abortStream = false): Promise<boolean> {
+    try {
+      const response = await fetch('/api/chat/cancel-tool', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ toolCallId }),
+      })
+      const data = await response.json()
+      
+      if (data.success) {
+        const store = useChatStore.getState()
+        store.cancelTool(messageId, toolCallId)
+        
+        if (abortStream) {
+          this.abortStream()
+        }
+      }
+      return data.success
+    } catch (e) {
+      console.error('[ChatService] cancelTool failed:', e)
+      return false
+    }
+  },
+
+  /**
+   * 加载会话消息
+   */
+  async loadMessages(conversationId: string): Promise<void> {
     const store = useChatStore.getState()
-    
-    // 防抖：如果正在发送，则忽略新的发送请求
-    if (store.isSendingMessage) return
 
-    // 1. 构造用户消息并立刻上屏
-    const userMessage: Message = {
-      id: nanoid(),
-      role: 'user',
-      content,
-      conversationId,
-      createdAt: Date.now(),
+    if (store.isSendingMessage) {
+      console.log('[ChatService] Skipping loadMessages - sending in progress')
+      return
     }
-    store.addMessage(userMessage)
-    store.setSendingMessage(true)
 
-    // 2. 预先构造 AI 的空回复消息，先占位（此时屏幕上会出现一个空的 AI 气泡）
-    const assistantMessageId = nanoid()
-    const assistantMessage: Message = {
-      id: assistantMessageId,
-      role: 'assistant',
-      content: '', // 初始内容为空
-      conversationId,
-      createdAt: Date.now(),
+    if (store.streamingMessageId) {
+      this.abortStream()
     }
-    store.addMessage(assistantMessage)
-    
-    // 标记这条消息正在“流式生成”，UI 可以据此显示闪烁光标
-    store.startStreaming(assistantMessageId)
 
-    // 准备可以被中断的 Fetch 请求
-    streamAbortController = new AbortController()
+    loadAbortController?.abort()
+    loadAbortController = new AbortController()
+
+    const cached = store.getCachedMessages(conversationId)
+    const hasCache = cached && cached.length > 0
+
+    if (!hasCache) {
+      store.setLoadingMessages(true, conversationId)
+    } else {
+      store.setMessages(cached)
+    }
 
     try {
-      // 3. 向我们写的后端 API 发起请求
-      // 取出当前的所有历史消息作为上下文发给大模型
-      // 注意：不能把最后一条空的 assistant 消息发给大模型，否则会被认为最新消息为空！
-      const currentMessages = useChatStore.getState().messages
-      const messagesToSend = currentMessages
-        .filter(m => m.id !== assistantMessageId) // 过滤掉刚刚占位的空 AI 消息
-        .map(m => ({ role: m.role, content: m.content }))
+      const response = await fetch(`/api/conversations/${conversationId}/messages`, {
+        signal: loadAbortController.signal
+      })
       
+      if (!response.ok) {
+        if (response.status === 404) {
+          console.warn('[ChatService] Conversation not found, redirecting to home')
+          window.location.href = '/'
+          return
+        }
+        throw new Error('Failed to load messages')
+      }
+
+      const data = await response.json()
+      const messages = data.messages || []
+
+      // 去重
+      const unique = messages.filter(
+        (msg: Message, i: number, arr: Message[]) => arr.findIndex((m) => m.id === msg.id) === i
+      ) as Message[]
+
+      store.cacheMessages(conversationId, unique)
+      store.setMessages(unique)
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return
+      console.error('[ChatService] loadMessages failed:', e)
+    } finally {
+      loadAbortController = null
+      store.setLoadingMessages(false)
+    }
+  },
+
+  /**
+   * 发送消息
+   */
+  async sendMessage(
+    conversationId: string,
+    content: string,
+    options: {
+      createUserMessage?: boolean
+      attachments?: FileAttachment[]
+      enableImageGeneration?: boolean
+      imageConfig?: { prompt: string; negative_prompt?: string; image_size: string }
+    } = {}
+  ): Promise<void> {
+    const { createUserMessage = true, attachments, enableImageGeneration, imageConfig } = options
+    const store = useChatStore.getState()
+
+    if (store.isSendingMessage) {
+      console.log('[ChatService] Already sending, skipping')
+      return
+    }
+    store.setSendingMessage(true)
+
+    const userMessageId = createUserMessage ? nanoid() : undefined
+    const aiMessageId = nanoid()
+
+    // 添加用户消息
+    if (createUserMessage && userMessageId) {
+      store.addMessage({
+        id: userMessageId,
+        role: 'user',
+        content,
+        attachments,
+      })
+    }
+
+    // 添加 AI 占位消息
+    store.addMessage({
+      id: aiMessageId,
+      role: 'assistant',
+      content: '',
+      thinking: '',
+      displayState: 'waiting',
+    })
+
+    try {
+      streamAbortController = new AbortController()
+
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: messagesToSend,
+          content,
           conversationId,
-          model: store.selectedModel, 
+          model: store.selectedModel,
+          enableThinking: store.enableThinking,
+          enableWebSearch: store.enableWebSearch,
+          enableImageGeneration,
+          imageConfig,
+          thinkingBudget: 4096,
+          userMessageId,
+          aiMessageId,
+          attachments,
         }),
         signal: streamAbortController.signal,
       })
 
-      if (!response.ok || !response.body) {
-        throw new Error('网络请求失败')
+      if (!response.ok) throw new Error(`API error: ${response.status}`)
+
+      // 同步标题
+      const newTitle = response.headers.get('X-Conversation-Title')
+      if (newTitle) {
+        const decodedTitle = decodeURIComponent(newTitle)
+        try {
+          const { useConversationStore } = await import('@/features/conversation/store/conversation-store')
+          useConversationStore.setState((state) => ({
+            conversations: state.conversations.map((c) =>
+              c.id === conversationId ? { ...c, title: decodedTitle } : c
+            )
+          }))
+        } catch(e) {}
       }
 
-      // 4. 接管水管 (ReadableStream)
-      const reader = response.body.getReader()
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('No reader')
 
-      // 5.开始源源不断地解析水流
-      await SSEParser.parseStream(reader, {
-         onData: (data) => {
-          // ======== 新增：拦截思考过程 ========
-          // 如果后端返回的 data 包含 thinkingDelta 字段，就塞给思考过程！
-          if (data.type === 'text-delta' && data.thinkingDelta) {
-            useChatStore.getState().appendThinking(assistantMessageId, data.thinkingDelta)
-          } 
-          // 否则就是正常的文本，塞给正文！
-          else if (data.type === 'text-delta' && data.textDelta) {
-            useChatStore.getState().appendContent(assistantMessageId, data.textDelta)
-          }
-          // ====================================
-        },
-        onError: (error) => {
-          console.error('流解析发生错误:', error)
-          useChatStore.getState().updateMessage(assistantMessageId, {
-            content: useChatStore.getState().messages.find(m => m.id === assistantMessageId)?.content + '\n\n*(网络连接中断)*'
-          })
-        },
-        onComplete: () => {
-          console.log('AI 生成完毕')
-          // ======== 新增：刷新侧边栏标题 ========
-          // 如果当前会话里只有一条用户消息和一条AI消息，说明是首聊结束
-          const store = useChatStore.getState()
-          if (store.messages.length <= 2) {
-            // 等待一两秒钟，给后端大模型生成标题留点时间
-            setTimeout(() => {
-              useConversationStore.getState().loadConversations()
-            }, 2000)
-          }
-          // ===================================
-        }
-      })
-
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        console.log('用户主动停止了生成')
-      } else {
-        console.error('发送消息失败:', error)
-        // 给个兜底的错误提示
-        useChatStore.getState().updateMessage(assistantMessageId, {
-          content: '抱歉，服务出现了一些问题，请稍后再试。'
-        })
+      await this.handleStream(reader, aiMessageId)
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') {
+        store.updateMessage(aiMessageId, { displayState: 'idle' })
+        return
       }
-    } finally {
-      // 6. 收尾工作，重置状态
-      store.setSendingMessage(false)
+      console.error('[ChatService] sendMessage failed:', e)
+      store.updateMessage(aiMessageId, { hasError: true, displayState: 'error' })
       store.stopStreaming()
+    } finally {
       streamAbortController = null
+      store.setSendingMessage(false)
+      // 更新消息缓存
+      const currentMessages = useChatStore.getState().messages
+      useChatStore.getState().cacheMessages(conversationId, currentMessages)
     }
   },
 
   /**
-   * 加载指定会话的历史消息
+   * 处理 SSE 流
    */
-  async loadMessages(conversationId: string) {
+  async handleStream(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    messageId: string
+  ): Promise<void> {
     const store = useChatStore.getState()
-    
-    // 如果正在发消息，为了防止状态混乱，先跳过加载
-    if (store.isSendingMessage) return
+    store.initMessageState(messageId)
+
+    const thinkingBuffer = new StreamBuffer({
+      onFlush: (content) => useChatStore.getState().appendThinking(messageId, content),
+    })
+
+    const answerBuffer = new StreamBuffer({
+      onFlush: (content) => useChatStore.getState().appendContent(messageId, content),
+    })
 
     try {
-      const response = await fetch(`/api/conversations/${conversationId}/messages`)
-      
-      if (!response.ok) {
-        if (response.status === 404) {
-          console.warn('该会话不存在或已被删除')
-          // 可选：重定向回首页
-          // window.location.href = '/'
-        }
-        return
-      }
+      await SSEParser.parseStream(reader, {
+        onData: (data) => {
+          const s = useChatStore.getState()
 
-      const data = await response.json()
-      
-      if (data.messages) {
-        // 直接用后端的全量历史消息，覆盖掉当前 Zustand store 里的消息数组！
-        store.setMessages(data.messages)
-      }
-    } catch (error) {
-      console.error('加载历史消息失败:', error)
+          if (data.type === 'thinking' && data.content) {
+            if (s.streamingPhase !== 'thinking') {
+              s.startStreaming(messageId, 'thinking')
+              s.transitionPhase(messageId, { type: 'START_THINKING' })
+              s.updateMessage(messageId, { displayState: 'streaming' })
+            }
+            thinkingBuffer.append(data.content)
+          } else if (data.type === 'answer' && data.content) {
+            if (s.streamingPhase !== 'answer') {
+              s.startStreaming(messageId, 'answer')
+              s.transitionPhase(messageId, { type: 'START_ANSWERING' })
+              s.updateMessage(messageId, { displayState: 'streaming' })
+            }
+            answerBuffer.append(data.content)
+          } else if (data.type === 'tool_call') {
+            const toolCallId = data.toolCallId || nanoid()
+            s.transitionPhase(messageId, {
+              type: 'START_TOOL_CALL',
+              toolCallId,
+              name: data.name || 'unknown',
+              args: { query: data.query, prompt: data.prompt },
+            })
+            
+            const msg = s.messages.find((m) => m.id === messageId)
+            const invocations = msg?.toolInvocations || []
+            const newInvocation = {
+              toolCallId,
+              name: data.name || 'unknown',
+              state: 'running' as const,
+              args: {
+                query: data.query,
+                prompt: data.prompt,
+              },
+            }
+            s.updateMessage(messageId, {
+              toolInvocations: [...invocations, newInvocation],
+              displayState: 'streaming',
+            })
+          } else if (data.type === 'tool_progress') {
+            if (data.toolCallId && data.progress !== undefined) {
+              s.transitionPhase(messageId, {
+                type: 'TOOL_PROGRESS',
+                toolCallId: data.toolCallId,
+                progress: data.progress,
+                estimatedTime: data.estimatedTime,
+              })
+              s.updateToolProgress(messageId, data.toolCallId, data.progress, data.estimatedTime)
+            }
+          } else if (data.type === 'tool_result') {
+            s.transitionPhase(messageId, {
+              type: 'TOOL_COMPLETE',
+              toolCallId: data.toolCallId || '',
+              success: data.success ?? false,
+              result: {
+                imageUrl: data.imageUrl,
+                resultCount: data.resultCount,
+                sources: data.sources,
+              },
+            })
+
+            const msg = s.messages.find((m) => m.id === messageId)
+            const invocations = msg?.toolInvocations || []
+            const updatedInvocations = invocations.map((inv) => {
+              const isMatch = data.toolCallId
+                ? inv.toolCallId === data.toolCallId
+                : inv.name === data.name && inv.state === 'running'
+              if (isMatch) {
+                return {
+                  ...inv,
+                  state: data.success ? ('completed' as const) : ('failed' as const),
+                  result: {
+                    success: data.success ?? false,
+                    imageUrl: data.imageUrl,
+                    resultCount: data.resultCount,
+                    sources: data.sources,
+                    width: data.width,
+                    height: data.height,
+                  },
+                }
+              }
+              return inv
+            })
+
+            if (data.name === 'generate_image' && data.success && data.imageUrl) {
+              const imageData = JSON.stringify({
+                url: data.imageUrl,
+                alt: invocations.find((inv) => inv.toolCallId === data.toolCallId)?.args?.prompt || '生成的图片',
+                width: data.width || 512,
+                height: data.height || 512,
+              })
+              answerBuffer.append(`\n\`\`\`image\n${imageData}\n\`\`\`\n`)
+            }
+
+            s.updateMessage(messageId, {
+              toolInvocations: updatedInvocations,
+            })
+          } else if (data.type === 'complete') {
+            thinkingBuffer.forceFlush()
+            answerBuffer.forceFlush()
+            s.transitionPhase(messageId, { type: 'COMPLETE' })
+            s.stopStreaming()
+            s.updateMessage(messageId, { displayState: 'idle' })
+          }
+        },
+        onError: (error) => {
+          console.error('[ChatService] stream error:', error)
+          thinkingBuffer.forceFlush()
+          answerBuffer.forceFlush()
+          const s = useChatStore.getState()
+          s.transitionPhase(messageId, { type: 'ERROR', message: error.message })
+          s.updateMessage(messageId, { hasError: true, displayState: 'error' })
+          s.stopStreaming()
+        },
+        onComplete: () => {
+          thinkingBuffer.forceFlush()
+          answerBuffer.forceFlush()
+          const s = useChatStore.getState()
+          s.stopStreaming()
+          s.updateMessage(messageId, { displayState: 'idle' })
+        },
+      })
+    } finally {
+      thinkingBuffer.destroy()
+      answerBuffer.destroy()
     }
+  },
+
+  /**
+   * 重试消息
+   */
+  async retryMessage(conversationId: string, messageId: string): Promise<void> {
+    const store = useChatStore.getState()
+
+    if (store.streamingMessageId) {
+      store.stopStreaming('user_retry')
+    }
+
+    const index = store.messages.findIndex((m) => m.id === messageId)
+    if (index === -1) return
+
+    const message = store.messages[index]
+    if (message.role !== 'assistant') return
+
+    const removed = store.removeMessagesFrom(index)
+    const idsToDelete = removed.map((m) => m.id)
+
+    const lastUserMsg = [...store.messages].reverse().find((m) => m.role === 'user')
+    if (!lastUserMsg) return
+
+    if (idsToDelete.length > 0) {
+      fetch('/api/messages/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageIds: idsToDelete }),
+      }).catch(console.error)
+    }
+
+    await this.sendMessage(conversationId, lastUserMsg.content, { 
+      createUserMessage: false,
+    })
+  },
+
+  /**
+   * 编辑并重发
+   */
+  async editAndResend(
+    conversationId: string,
+    messageId: string,
+    newContent: string
+  ): Promise<void> {
+    const store = useChatStore.getState()
+    const index = store.messages.findIndex((m) => m.id === messageId)
+
+    if (index === -1) return
+    if (store.messages[index].role !== 'user') return
+
+    const removed = store.removeMessagesFrom(index)
+    const idsToDelete = removed.map((m) => m.id)
+
+    if (idsToDelete.length > 0) {
+      fetch('/api/messages/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messageIds: idsToDelete }),
+      }).catch(console.error)
+    }
+
+    await this.sendMessage(conversationId, newContent, { createUserMessage: true })
   },
 }

@@ -1,92 +1,63 @@
-// features/chat/components/MessageActions/index.tsx
 'use client'
 
 import { useState } from 'react'
-import { Copy, Check, RotateCw, Volume2 } from 'lucide-react'
+import { Copy, Check, RotateCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { useChatStore } from '@/features/chat/store/chat.store'
-import { ChatService } from '@/features/chat/services/chat.service'
+import { cn } from '@/lib/utils'
 
 interface MessageActionsProps {
-  messageId: string
   content: string
+  messageId: string
   role: 'user' | 'assistant'
+  hasError?: boolean
+  onRetry?: () => void
 }
 
-export function MessageActions({ messageId, content, role }: MessageActionsProps) {
-  const [isCopied, setIsCopied] = useState(false)
-  const isSendingMessage = useChatStore(s => s.isSendingMessage)
+export function MessageActions({ content, role, hasError, onRetry }: MessageActionsProps) {
+  const [copied, setCopied] = useState(false)
 
-  // 1. 复制到剪贴板
   const handleCopy = async () => {
+    if (!content) return
     try {
       await navigator.clipboard.writeText(content)
-      setIsCopied(true)
-      setTimeout(() => setIsCopied(false), 2000)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
     } catch (err) {
-      console.error('复制失败:', err)
+      console.error('Failed to copy text: ', err)
     }
   }
 
-  // 2. 重新生成（仅限 AI 消息）
-  const handleRegenerate = () => {
-    if (isSendingMessage) return
-    
-    const store = useChatStore.getState()
-    const conversationId = store.messages[0]?.conversationId
-    
-    // 找到当前这条 AI 消息对应的“上一条用户消息”
-    const currentIndex = store.messages.findIndex(m => m.id === messageId)
-    const prevUserMessage = store.messages.slice(0, currentIndex).reverse().find(m => m.role === 'user')
-    
-    if (prevUserMessage) {
-      // 简单粗暴的重新生成逻辑：切断当前流，重新发送上一条消息
-      ChatService.sendMessage(prevUserMessage.content, conversationId)
-    }
-  }
-
-  // 3. 语音朗读
-  const handlePlayAudio = () => {
-    alert('正在开发中：这里将接入真实的 Text-to-Speech 语音合成！')
-  }
+  // 只有 AI 消息才显示操作栏
+  if (role !== 'assistant') return null
 
   return (
-    <div className={`flex items-center gap-1 mt-2 opacity-0 transition-opacity duration-200 group-hover:opacity-100 ${role === 'user' ? 'justify-end' : 'justify-start'}`}>
-      
-      {/* 朗读按钮 */}
-      {role === 'assistant' && (
-        <Button 
-          variant="ghost" 
-          size="icon" 
-          className="h-7 w-7 text-gray-400 hover:text-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800"
-          onClick={handlePlayAudio}
-          title="朗读"
-        >
-          <Volume2 className="h-3.5 w-3.5" />
-        </Button>
-      )}
-
-      {/* 复制按钮 */}
-      <Button 
-        variant="ghost" 
-        size="icon" 
-        className="h-7 w-7 text-gray-400 hover:text-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800"
+    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      <Button
+        variant="ghost"
+        size="icon"
         onClick={handleCopy}
+        className={cn(
+          "h-7 w-7 hover:bg-gray-100 dark:hover:bg-gray-800",
+          copied && "text-green-500 hover:text-green-600"
+        )}
         title="复制内容"
       >
-        {isCopied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+        {copied ? (
+          <Check className="h-3.5 w-3.5" />
+        ) : (
+          <Copy className="h-3.5 w-3.5" />
+        )}
       </Button>
 
-      {/* 重新生成按钮 */}
-      {role === 'assistant' && !isSendingMessage && (
-        <Button 
-          variant="ghost" 
-          size="icon" 
-          className="h-7 w-7 text-gray-400 hover:text-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800"
-          onClick={handleRegenerate}
-          title="重新生成"
+      {onRetry && (
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onRetry}
+          className="h-7 w-7 hover:bg-gray-100 dark:hover:bg-gray-800"
+          title={hasError ? "重试" : "重新生成"}
         >
-          <RotateCw className="h-3.5 w-3.5" />
+          <RotateCw className={cn("h-3.5 w-3.5", hasError && "text-red-500")} />
         </Button>
       )}
     </div>
