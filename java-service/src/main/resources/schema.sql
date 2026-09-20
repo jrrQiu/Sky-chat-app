@@ -1,0 +1,42 @@
+CREATE TABLE IF NOT EXISTS user_account (
+    id VARCHAR(64) PRIMARY KEY,
+    email VARCHAR(320) NOT NULL UNIQUE,
+    name VARCHAR(120) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS conversation (
+    id VARCHAR(64) PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    pinned_at TIMESTAMP NULL
+);
+
+CREATE TABLE IF NOT EXISTS message (
+    id VARCHAR(64) PRIMARY KEY,
+    role VARCHAR(16) NOT NULL,
+    content TEXT NOT NULL,
+    conversation_id VARCHAR(64) NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_conversation ON message(conversation_id);
+
+CREATE TABLE IF NOT EXISTS approval_task (
+    id VARCHAR(64) PRIMARY KEY,
+    run_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    agent_id VARCHAR(32) NOT NULL,
+    intent VARCHAR(128) NULL,
+    risk_level VARCHAR(16) NULL,
+    rule_id VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_approval_user ON approval_task(user_id);

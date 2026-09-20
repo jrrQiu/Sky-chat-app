@@ -2,6 +2,8 @@
 
 # dependencies
 /node_modules
+/front-service/node_modules
+/.m2/
 /.pnp
 .pnp.*
 .yarn/*
@@ -13,12 +15,24 @@
 # testing
 /coverage
 
-# next.js
-/.next/
-/out/
-
 # production
 /build
+/dist
+/front-service/dist
+/.vite
+/front-service/.vite
+/.next/
+
+# Codex runtime logs
+/.codex-runtime-logs/
+
+# Java
+/java-service/.m2
+/java-service/target
+
+# Python
+/agent-service/.venv
+/agent-service/**/__pycache__
 
 # misc
 .DS_Store
@@ -38,6 +52,7 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
-next-env.d.ts
-
 /app/generated/prisma
+
+# local toolchains
+/.tools/

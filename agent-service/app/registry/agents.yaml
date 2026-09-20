@@ -1,0 +1,105 @@
+agents:
+  - id: orchestrator
+    name: Orchestrator
+    description: Classifies intent, assesses risk, and routes to specialist agents.
+    model_hint: lightweight-classifier
+    prompt_version: 1
+    tools:
+      - agent_registry
+      - policy_api
+    permissions:
+      - agent:select
+      - run:read
+
+  - id: it
+    name: IT Agent
+    description: Handles password reset, software install, device issues, and unlocks.
+    model_hint: general-with-structured-output
+    prompt_version: 1
+    tools:
+      - idp
+      - mdm
+      - software_center
+    permissions:
+      - it:password_reset
+      - it:device:read
+      - it:software:install
+
+  - id: network
+    name: Network Agent
+    description: Handles VPN, Wi-Fi, firewall, and internal system access.
+    model_hint: general-with-tool-calling
+    prompt_version: 1
+    tools:
+      - vpn_api
+      - cmdb
+      - permission_system
+    permissions:
+      - network:vpn:read
+      - network:vpn:create
+      - network:access:read
+
+  - id: hr
+    name: HR Agent
+    description: Handles leave, onboarding, certificates, and employee data.
+    model_hint: general
+    prompt_version: 1
+    tools:
+      - hris
+      - organization_service
+      - form_service
+    permissions:
+      - hr:profile:read
+      - hr:leave:read
+      - hr:onboarding:read
+
+  - id: finance
+    name: Finance Agent
+    description: Handles reimbursement, invoices, budgets, purchases, and payments.
+    model_hint: general-with-ocr
+    prompt_version: 1
+    tools:
+      - erp
+      - ocr
+      - budget_service
+    permissions:
+      - finance:invoice:read
+      - finance:budget:read
+
+  - id: knowledge
+    name: Knowledge Agent
+    description: Retrieves policies, SOPs, and historical tickets with citations.
+    model_hint: embedding-reranker-general
+    prompt_version: 1
+    tools:
+      - pgvector
+      - elasticsearch
+      - reranker
+    permissions:
+      - knowledge:read
+
+  - id: approval
+    name: Approval Agent
+    description: Decides whether approval is required and manages approval tasks.
+    model_hint: rules-first
+    prompt_version: 1
+    tools:
+      - rule_engine
+      - temporal
+      - notification_system
+    permissions:
+      - approval:read
+      - approval:create
+
+  - id: guardian
+    name: Guardian Agent
+    description: Checks permissions, sensitive data, prompt injection, and results.
+    model_hint: rules-or-independent-model
+    prompt_version: 1
+    tools:
+      - rbac
+      - dlp
+      - audit_service
+    permissions:
+      - audit:write
+      - policy:enforce

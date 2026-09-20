@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+langgraph>=0.2.60
+langchain-core>=0.3.0
+litellm>=1.50.0
+PyYAML>=6.0.2
+PyJWT>=2.9.0
+redis>=5.0.0
+python-dotenv>=1.0.0
+langfuse>=2.50.0
+opentelemetry-api>=1.24.0
+opentelemetry-sdk>=1.24.0
+opentelemetry-instrumentation-fastapi>=0.45b0

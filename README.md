@@ -1,36 +1,100 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Sky Chat
 
-## Getting Started
+Sky Chat 是一个企业服务台 Agent 应用，当前仓库按职责拆成三个运行单元：
 
-First, run the development server:
+- `前端`：Vite + React + TypeScript，提供聊天、会话管理和登录界面。
+- `java-service`：Spring Boot 3 + WebFlux + MyBatis，负责账号、会话、消息、审批和 SSE 业务代理。
+- `agent-service`：FastAPI + LangGraph + LiteLLM，负责 Guardian、Orchestrator、工具调用和最终回答生成。
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## 目录
+
+```text
+front-service/    React/Vite 前端
+java-service/     Java 业务服务
+agent-service/    Python Agent 服务
+docs/             架构说明
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## 本地启动
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### 1. 基础设施
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```powershell
+docker compose up -d
+```
 
-## Learn More
+启动 PostgreSQL 和 Redis。PostgreSQL 映射到 `localhost:5433`，默认账号为
+`skychat/password123`。
 
-To learn more about Next.js, take a look at the following resources:
+### 2. Java 业务服务
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```powershell
+cd java-service
+mvn spring-boot:run
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+默认地址：`http://localhost:8080`。启动时会执行
+`src/main/resources/schema.sql` 初始化表结构。
 
-## Deploy on Vercel
+### 3. Python Agent 服务
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```powershell
+cd agent-service
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+默认地址：`http://localhost:8000`。Java 服务通过
+`AGENT_SERVICE_URL` 调用它。
+
+### 4. React 前端
+
+```powershell
+cd front-service
+npm install
+npm run dev
+```
+
+默认地址：`http://localhost:5173`。前端默认访问
+`http://localhost:8080`，如需修改请设置 `VITE_API_BASE_URL`。
+
+## 环境变量
+
+前端示例见 `front-service/.env.example`。
+
+Java 服务主要变量：
+
+```text
+DB_URL=jdbc:postgresql://localhost:5433/skychat
+DB_USERNAME=skychat
+DB_PASSWORD=password123
+REDIS_HOST=localhost
+REDIS_PORT=6379
+AGENT_SERVICE_URL=http://localhost:8000
+AGENT_SERVICE_TOKEN=replace-with-internal-jwt
+JWT_SECRET=replace-with-a-long-random-secret
+```
+
+Agent 服务主要变量：
+
+```text
+AGENT_SERVICE_TOKEN=replace-with-internal-jwt
+DATABASE_URL=postgresql://skychat:password123@localhost:5433/skychat
+REDIS_URL=redis://localhost:6379/0
+DEEPSEEK_API_KEY=your-deepseek-key
+```
+
+## 架构边界
+
+浏览器只与 Java 业务服务通信。Java 服务负责登录鉴权、会话/消息持久化和 SSE
+代理；Python Agent 服务不直接暴露给浏览器，只接收 Java 服务转发的标准化
+请求，并返回 SSE 事件。
+
+```text
+Browser (React/Vite)
+  -> Java business service (Spring Boot/WebFlux)
+       -> PostgreSQL/Redis
+       -> Python agent service (FastAPI/LangGraph)
+```

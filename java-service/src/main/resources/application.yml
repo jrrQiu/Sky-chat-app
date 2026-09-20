@@ -1,0 +1,30 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: sky-chat-java-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/skychat}
+    username: ${DB_USERNAME:skychat}
+    password: ${DB_PASSWORD:password123}
+    driver-class-name: ${DB_DRIVER:org.postgresql.Driver}
+  sql:
+    init:
+      mode: always
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+agent-service:
+  url: ${AGENT_SERVICE_URL:http://localhost:8000}
+  token: ${AGENT_SERVICE_TOKEN:replace-with-internal-jwt}
+
+auth:
+  jwt-secret: ${JWT_SECRET:skychat-local-jwt-secret-change-me}
+  jwt-ttl-seconds: ${JWT_TTL_SECONDS:604800}
