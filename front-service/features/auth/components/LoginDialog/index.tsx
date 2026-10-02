@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { login, register } from '@/features/auth/services/auth.service'
+import { login } from '@/features/auth/services/auth.service'
 import { useAuthStore } from '@/features/auth/store/auth.store'
 
 interface LoginDialogProps {
@@ -19,17 +19,13 @@ interface LoginDialogProps {
   onSuccess: () => void
 }
 
-type AuthMode = 'login' | 'register'
-
 export function LoginDialog({
   open,
   onOpenChange,
   onSuccess,
 }: LoginDialogProps) {
-  const [mode, setMode] = useState<AuthMode>('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [name, setName] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const setSession = useAuthStore((state) => state.login)
@@ -37,14 +33,8 @@ export function LoginDialog({
   const reset = () => {
     setEmail('')
     setPassword('')
-    setName('')
     setError('')
     setLoading(false)
-  }
-
-  const handleModeChange = (nextMode: AuthMode) => {
-    setMode(nextMode)
-    setError('')
   }
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -53,13 +43,8 @@ export function LoginDialog({
     setLoading(true)
 
     try {
-      if (mode === 'register') {
-        const session = await register({ email, password, name })
-        setSession(session.token, session.user)
-      } else {
-        const session = await login({ email, password })
-        setSession(session.token, session.user)
-      }
+      const session = await login({ email, password })
+      setSession(session.token, session.user)
 
       reset()
       onOpenChange(false)
@@ -81,40 +66,11 @@ export function LoginDialog({
             欢迎来到 Sky-Chat
           </DialogTitle>
           <DialogDescription className="text-center">
-            {mode === 'login' ? '登录你的账号' : '创建一个新账号'}
+            登录你的账号
           </DialogDescription>
         </DialogHeader>
 
-        <div className="bg-muted flex rounded-lg p-1">
-          <Button
-            type="button"
-            variant={mode === 'login' ? 'default' : 'ghost'}
-            className="flex-1"
-            onClick={() => handleModeChange('login')}
-          >
-            登录
-          </Button>
-          <Button
-            type="button"
-            variant={mode === 'register' ? 'default' : 'ghost'}
-            className="flex-1"
-            onClick={() => handleModeChange('register')}
-          >
-            注册
-          </Button>
-        </div>
-
         <form onSubmit={handleSubmit} className="space-y-3">
-          {mode === 'register' && (
-            <Input
-              type="text"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="昵称"
-              required
-              disabled={loading}
-            />
-          )}
           <Input
             type="email"
             value={email}
@@ -129,7 +85,6 @@ export function LoginDialog({
             onChange={(event) => setPassword(event.target.value)}
             placeholder="密码"
             required
-            minLength={6}
             disabled={loading}
           />
 
@@ -140,8 +95,13 @@ export function LoginDialog({
           )}
 
           <Button type="submit" className="w-full" disabled={loading}>
-            {loading ? '请稍候...' : mode === 'login' ? '登录' : '注册并登录'}
+            {loading ? '请稍候...' : '登录'}
           </Button>
+
+          {/* 自助注册已关闭，账号只能由管理员开通或通过邀请链接激活 */}
+          <p className="text-center text-xs text-gray-500 dark:text-gray-400">
+            账号由管理员开通，或使用邀请链接设置密码
+          </p>
         </form>
       </DialogContent>
     </Dialog>

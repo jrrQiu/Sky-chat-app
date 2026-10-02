@@ -1,8 +1,10 @@
 // components/Sidebar/SidebarNav.tsx
 import { useEffect } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { MessagesSquare, ShieldCheck } from 'lucide-react'
+import { MessagesSquare, ShieldCheck, UsersRound } from 'lucide-react'
 import { useApprovalStore } from '@/features/approvals/store/approval.store'
+import { hasAdminRole } from '@/features/admin/types'
+import { useAuthStore } from '@/features/auth/store/auth.store'
 
 interface SidebarNavProps {
   collapsed: boolean
@@ -19,6 +21,7 @@ const BADGE_POLL_MS = 60_000
 export function SidebarNav({ collapsed }: SidebarNavProps) {
   const pendingForMe = useApprovalStore((state) => state.pendingForMe)
   const refreshBadge = useApprovalStore((state) => state.refreshBadge)
+  const user = useAuthStore((state) => state.user)
   const location = useLocation()
 
   useEffect(() => {
@@ -30,9 +33,13 @@ export function SidebarNav({ collapsed }: SidebarNavProps) {
     // 切换路由时立刻校准一次角标。
   }, [refreshBadge, location.pathname])
 
+  // 成员管理只对管理员可见；服务端会对每个接口再校验一次角色。
   const items = [
     { to: '/chat', label: '对话', icon: MessagesSquare },
     { to: '/approvals', label: '审批中心', icon: ShieldCheck },
+    ...(hasAdminRole(user?.roles)
+      ? [{ to: '/admin/users', label: '成员管理', icon: UsersRound }]
+      : []),
   ]
 
   return (
