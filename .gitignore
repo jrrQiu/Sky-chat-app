@@ -56,3 +56,10 @@ yarn-error.log*
 
 # local toolchains
 /.tools/
+
+# runtime logs (agent-service writes these next to the app)
+*.log
+
+# python test / type-check caches
+.pytest_cache/
+.ruff_cache/

@@ -4,7 +4,7 @@ Sky Chat 是一个企业服务台 Agent 应用，当前仓库按职责拆成三�
 
 - `前端`：Vite + React + TypeScript，提供聊天、会话管理和登录界面。
 - `java-service`：Spring Boot 3 + WebFlux + MyBatis，负责账号、会话、消息、审批和 SSE 业务代理。
-- `agent-service`：FastAPI + LangGraph + LiteLLM，负责 Guardian、Orchestrator、工具调用和最终回答生成。
+- `agent-service`：FastAPI + LangGraph + direct model gateway，负责 Guardian、Orchestrator、工具调用和最终回答生成。
 
 ## 目录
 
@@ -43,11 +43,19 @@ cd agent-service
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m app
 ```
 
 默认地址：`http://localhost:8000`。Java 服务通过
 `AGENT_SERVICE_URL` 调用它。
+
+> Windows 上请用 `python -m app` 启动。uvicorn 在非 reload 模式下会硬编码
+> `ProactorEventLoop`，而 psycopg 的异步驱动无法在其上运行（`CHECKPOINT_BACKEND=postgres`
+> 时会直接失败）。`uvicorn app.main:app --reload` 也可用（reload 子进程走 Selector loop）。
+>
+> 服务间身份已改为**签名 JWT**：`AGENT_INTERNAL_JWT_SECRET` 必须与 Java 侧配置一致，
+> 否则生产环境拒绝启动、非生产环境所有接口返回 503。旧的静态
+> `AGENT_SERVICE_TOKEN` 仅作为非生产的逃生通道（`ALLOW_STATIC_INTERNAL_TOKEN=true`）。
 
 ### 4. React 前端
 
@@ -81,6 +89,7 @@ Agent 服务主要变量：
 
 ```text
 AGENT_SERVICE_TOKEN=replace-with-internal-jwt
+AGENT_INTERNAL_JWT_SECRET=<至少 32 字节随机值，两侧必须一致>
 DATABASE_URL=postgresql://skychat:password123@localhost:5433/skychat
 REDIS_URL=redis://localhost:6379/0
 DEEPSEEK_API_KEY=your-deepseek-key
