@@ -14,6 +14,7 @@ What this proves that the in-memory tests cannot:
 """
 
 import asyncio
+import dataclasses
 import os
 
 import psycopg
@@ -126,6 +127,17 @@ def _clean_pg_state(pg_env, monkeypatch):
 
     monkeypatch.setattr(generate_node, "stream_completion", fake_stream_completion)
 
+    # The write action must reach the adapter for the exactly-once assertion to mean
+    # anything. Every action reports `external_implemented=False` by default, and
+    # `execute_approved_action` then deliberately skips the adapter, so this test marks it
+    # integrated to exercise the path it is actually about.
+    from app.tools import actions as actions_module
+
+    integrated = dataclasses.replace(
+        actions_module.ACTIONS[WRITE_ACTION], external_implemented=True
+    )
+    monkeypatch.setitem(actions_module.ACTIONS, WRITE_ACTION, integrated)
+
 
 class CountingAdapter:
     def __init__(self) -> None:
@@ -136,6 +148,11 @@ class CountingAdapter:
 
     async def execute(self, tool_name, args, state):
         self.calls.append(tool_name)
+        if tool_name == WRITE_ACTION:
+            # This fixture declares the action integrated, so the double must behave like a
+            # reachable target system. The mock provider deliberately refuses this action now,
+            # which would make the ledger record "failed" and the assertion below meaningless.
+            return {"success": True, "text": "账号和配置已开通。", "data": {"provisioned": True}}
         return await self._execute(tool_name, args, state)
 
 

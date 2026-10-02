@@ -10,6 +10,7 @@ These cover the acceptance criteria of the checkpoint design:
 
 import asyncio
 import copy
+import dataclasses
 import time
 import uuid
 
@@ -116,6 +117,25 @@ def _isolate_state(monkeypatch):
     approval_store._tasks.clear()
     ledger_module.effect_ledger._records.clear()
     ledger_module.effect_ledger._locks.clear()
+
+
+@pytest.fixture(autouse=True)
+def _integrated_write_action(monkeypatch):
+    """Treat the write action as having an integrated target system.
+
+    These tests are about the exactly-once *protocol*: the ledger must not run an approved
+    write twice across a restart or a resume. By default every action in the registry reports
+    `external_implemented=False`, and `execute_approved_action` then deliberately never calls
+    the adapter -- correct for production, but it would make an exactly-once assertion vacuous.
+    Marking the action integrated here exercises the path under test.
+    """
+    from app.tools import actions as actions_module
+
+    integrated = dataclasses.replace(
+        actions_module.ACTIONS[WRITE_ACTION], external_implemented=True
+    )
+    monkeypatch.setitem(actions_module.ACTIONS, WRITE_ACTION, integrated)
+    yield
 
 
 @pytest.fixture

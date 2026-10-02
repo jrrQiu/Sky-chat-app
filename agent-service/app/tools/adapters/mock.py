@@ -49,6 +49,21 @@ _SERVICE_ISSUE_PATTERN = re.compile(
 )
 
 
+def implemented_write_refusal(action: str) -> dict[str, Any]:
+    """Refuse a write action that has no integrated target system.
+
+    These actions used to answer with a hardcoded success ("账号和配置已开通", "报销单已
+    提交并进入付款流程"). The approval was real, so the reply read as confirmation of an
+    action that never happened. `execute_approved_action` no longer routes them here at
+    all; this guard exists so that even a direct call cannot produce a fabricated success.
+    """
+    return {
+        "success": False,
+        "text": f"写动作 {action} 尚未接入目标系统，未执行。",
+        "error": "ACTION_NOT_IMPLEMENTED",
+    }
+
+
 def ticket_tools_for_message(user_message: str, available: list[str]) -> list[str]:
     """Which ticket tools a message implies.
 
@@ -142,9 +157,11 @@ async def execute_mock_tool(
     async def approval_result(
         rule_id: str,
         agent_id: str,
-        pending_action: str,
     ) -> dict[str, Any]:
         turn_id = str(state.get("turn_id") or state.get("request_id", ""))
+        # Derived through the same helper `prepare_approval` uses, so the two paths cannot
+        # produce different approval keys for one turn (which would create two tasks).
+        pending_action = action_key(state.get("intent"))
         key = approval_key_for(turn_id, pending_action)
         task = await approval_store.create(
             task_id=approval_id_for(key),
@@ -181,12 +198,10 @@ async def execute_mock_tool(
             return await approval_result(
                 "NETWORK-VPN-REQUIRE-DUAL-APPROVAL",
                 "network",
-                "vpn_api_provision",
             )
         return await approval_result(
             "APPROVAL-TEMPORAL-TASK",
             "approval",
-            "approval_decision",
         )
 
     handlers = {
@@ -233,11 +248,7 @@ async def execute_mock_tool(
             "text": "当前用户具备访问申请条件，仍需审批确认。",
             "data": {"allowed": True},
         },
-        "vpn_api_provision": lambda: {
-            "success": True,
-            "text": "VPN 审批已通过，账号和配置已开通。",
-            "data": {"provisioned": True, "vpn_account": "vpn-user-001"},
-        },
+        "vpn_api_provision": lambda: implemented_write_refusal("vpn_api_provision"),
         "hris": lambda: {
             "success": True,
             "text": (
@@ -332,16 +343,8 @@ async def execute_mock_tool(
                 or str(state.get("intent", "")).startswith("approval")
             },
         },
-        "finance_submit": lambda: {
-            "success": True,
-            "text": "财务审批已通过，报销单已提交并进入付款流程。",
-            "data": {"payment_status": "submitted", "erp_task_id": "ERP-2001"},
-        },
-        "approval_decision": lambda: {
-            "success": True,
-            "text": "审批流程已完成，通知和审计记录已写入。",
-            "data": {"completed": True},
-        },
+        "finance_submit": lambda: implemented_write_refusal("finance_submit"),
+        "approval_decision": lambda: implemented_write_refusal("approval_decision"),
         "notification_system": lambda: {
             "success": True,
             "text": "已通知审批人。",

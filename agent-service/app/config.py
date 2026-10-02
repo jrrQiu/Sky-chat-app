@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # default because that is the point of a service desk, but an operator can turn
     # it off without losing the ticket tools themselves.
     ticket_auto_create_from_chat: bool = True
+    # When an approved high-risk action has no integrated target system, register the
+    # approved work as a change ticket in our own system of record. The external action
+    # still reports as not executed; this only ensures the approval leaves a trace.
+    high_risk_records_change_ticket: bool = True
 
     retrieval_use_llm: bool = False
     retrieval_use_postgres: bool = False

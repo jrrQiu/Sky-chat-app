@@ -4,6 +4,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
+from app.config import settings
 from app.core.audit import record_action
 from app.core.effect_ledger import effect_key_for, effect_ledger
 from app.core.guardrails import enforce_tool_rails
@@ -13,6 +14,7 @@ from app.persistence.approval_store import (
     approval_store,
 )
 from app.registry.rbac import authorize_agent, authorize_tool
+from app.tools.actions import ACTIONS, action_key, describe_outcome, resolve as resolve_action
 from app.tools.adapters import get_tool_adapter
 
 
@@ -242,13 +244,13 @@ async def prepare_approval(
     derived from turn + action, so a replay returns the existing task.
     """
     selected_agent = str(state.get("selected_agent", "approval"))
-    pending_action = {
-        "network": "vpn_api_provision",
-        "finance": "finance_submit",
-        "approval": "approval_decision",
-    }.get(selected_agent, "approval_decision")
+    # The action is derived from the *intent*, not from the agent. An agent serves several
+    # intents and only some of them write anything, and the old per-agent guess produced an
+    # action name ("approval_decision") for requests that had no external action at all.
+    action = resolve_action(state.get("intent"))
+    pending_action = action.name if action else ""
     turn_id = str(state.get("turn_id") or state.get("request_id", ""))
-    approval_key = approval_key_for(turn_id, pending_action)
+    approval_key = approval_key_for(turn_id, action_key(state.get("intent")))
     required_approver_roles = approver_roles_for(selected_agent)
 
     task = await approval_store.create(
@@ -301,24 +303,73 @@ async def execute_approved_action(
 ):
     emit = _emit(config)
     pending_action = str(state.get("pending_action", ""))
-    if not pending_action:
-        return {}
-
+    turn_id = str(state.get("turn_id") or state.get("request_id", ""))
     selected_agent = str(state.get("selected_agent", "approval"))
+    approval_id = str((state.get("approval") or {}).get("id") or "") or None
+    requested_action = ACTIONS.get(pending_action)
+
+    if requested_action is None:
+        # Nothing external to run. That is a real answer for an approval-decision request,
+        # and it is also what an intent with no wired-up action gets -- previously such
+        # requests were given the invented action name "approval_decision" and answered with
+        # a canned success string.
+        message = "审批已通过；该请求没有需要外部系统执行的动作。"
+        if emit:
+            await emit(
+                {
+                    "type": "tool_result",
+                    "toolCallId": f"write_{uuid.uuid4().hex[:12]}",
+                    "name": pending_action or "no-action",
+                    "success": True,
+                    "message": message,
+                }
+            )
+        return {
+            "tool_results": [
+                {
+                    "toolName": pending_action or "no-action",
+                    "success": True,
+                    "noActionRequired": True,
+                    "text": message,
+                }
+            ],
+            "status": "resuming",
+        }
+
     if not authorize_tool(state.get("user_context"), selected_agent, pending_action):
+        # The write is authorized against the *requester's* authority, not the approver's: an
+        # approval adds a second signature, it does not grant a permission the requester never
+        # held. That is deliberate (approvals must not become a privilege-escalation path), but
+        # the refusal has to be visible -- it previously returned without an audit record, so an
+        # approved action that never ran left no trace beyond the approval row itself.
         message = f"RBAC denied write action {pending_action}"
+        await record_action(
+            "tool.write",
+            object_type="tool",
+            object_id=pending_action,
+            outcome="denied",
+            actor_id=str(state.get("user_id") or "") or None,
+            detail={
+                "turn_id": turn_id,
+                "approval_id": approval_id,
+                "reason": "RBAC_DENIED",
+                "required_permission": "write action not granted to the requester's roles",
+                "external_executed": False,
+            },
+        )
         if emit:
             await emit({"type": "error", "message": message})
         return {
             "status": "failed",
             "guard_error": message,
-            "final_answer": message,
+            "final_answer": (
+                f"审批已通过，但当前账号没有执行「{requested_action.description}」的权限，"
+                f"该动作未执行。"
+            ),
         }
 
     adapter = get_tool_adapter()
-    turn_id = str(state.get("turn_id") or state.get("request_id", ""))
     tool_call_id = f"write_{uuid.uuid4().hex[:12]}"
-    approval_id = str((state.get("approval") or {}).get("id") or "") or None
     args = {
         "request_id": state.get("request_id"),
         "user_id": state.get("user_id"),
@@ -337,6 +388,36 @@ async def execute_approved_action(
             }
         )
 
+    async def record_change_ticket() -> int | None:
+        """Register the approved work in the system we actually own.
+
+        This part is real: it creates a change ticket through the same Java endpoint a
+        user-raised ticket goes through, so an approval leaves an auditable trail even when
+        the external call cannot be made. It is not a substitute for the external action and
+        the outcome text says so.
+        """
+        if not (requested_action.records_change_ticket and settings.high_risk_records_change_ticket):
+            return None
+        ticket_args = {
+            **args,
+            "type": "change",
+            "title": f"[变更] {requested_action.description}",
+            "description": (
+                f"由高风险审批触发。\n审批单：{approval_id or '未记录'}\n"
+                f"意图：{state.get('intent')}\n原始请求：{state.get('latest_user_message')}\n"
+                f"待执行动作：{pending_action}（目标系统尚未接入）"
+            ),
+        }
+        refusal = enforce_tool_rails("ticket_create", ticket_args, {})
+        if refusal is not None:
+            return None
+        result = await adapter.execute("ticket_create", ticket_args, state)
+        if not result.get("success"):
+            return None
+        data = result.get("data") or {}
+        number = data.get("number")
+        return int(number) if isinstance(number, (int, float, str)) and str(number).isdigit() else None
+
     async def invoke(provider_key: str) -> dict[str, Any]:
         call_args = {**args, "idempotency_key": provider_key}
         # Execution rail (before): the model does not get to invent arguments.
@@ -352,6 +433,23 @@ async def execute_approved_action(
             )
             return refusal
 
+        # The real, achievable half: register the approved work in our own system.
+        ticket_number = await record_change_ticket()
+
+        if not requested_action.external_implemented:
+            # The requested action did NOT happen. Saying otherwise was the defect, and the
+            # ledger is told so too (`success: False` records a failed effect, which a later
+            # run may retry once the target system exists).
+            text, error = describe_outcome(requested_action, ticket_number)
+            return {
+                "success": False,
+                "text": text,
+                "error": error,
+                "changeTicketNumber": ticket_number,
+                "externalAction": pending_action,
+                "externalExecuted": False,
+            }
+
         result = await adapter.execute(pending_action, call_args, state)
 
         # Execution rail (after): tool output re-enters the model loop.
@@ -366,7 +464,7 @@ async def execute_approved_action(
                 detail={"rail": refusal.get("rail_blocked")},
             )
             return refusal
-        return result
+        return {**result, "changeTicketNumber": ticket_number}
 
     try:
         result = await effect_ledger.run_once(
@@ -396,7 +494,10 @@ async def execute_approved_action(
         detail={
             "turn_id": turn_id,
             "approval_id": approval_id,
+            "external_executed": bool(result.get("externalExecuted", result.get("success"))),
+            "change_ticket_number": result.get("changeTicketNumber"),
             "deduplicated": bool(result.get("deduplicated")),
+            "error": result.get("error"),
         },
     )
 
@@ -423,12 +524,21 @@ async def verify_result(
     config: RunnableConfig | None = None,
 ):
     emit = _emit(config)
-    if emit:
-        await emit(
-            {
-                "type": "thinking",
-                "content": "写操作已完成，正在核对执行结果。",
-                "step": True,
-            }
+    if not emit:
+        return {}
+
+    writes = state.get("executed_writes") or []
+    failed = [w for w in writes if not w.get("success")]
+    if failed:
+        # The old text claimed the write had completed unconditionally, which read as
+        # confirmation of something that had not happened.
+        content = (
+            "写操作未成功执行："
+            + str(failed[0].get("text") or failed[0].get("error") or "未知原因")
         )
+    elif writes:
+        content = "写操作已执行，正在核对执行结果。"
+    else:
+        content = "本次没有需要执行的外部动作，正在整理答复。"
+    await emit({"type": "thinking", "content": content, "step": True})
     return {}

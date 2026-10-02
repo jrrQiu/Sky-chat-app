@@ -79,6 +79,26 @@ ALLOWED_TOOL_ARG_KEYS = frozenset(
     }
 )
 
+#: Structured arguments a first-party tool legitimately accepts, beyond the common
+#: correlation keys above.
+#:
+#: The rail exists so *the model* cannot invent arguments, so a tool with a defined schema
+#: declares that schema here. Widening the shared set instead would have loosened every other
+#: tool at the same time, which is the opposite of what a rail is for.
+TOOL_ARG_KEYS_EXTRA: dict[str, frozenset[str]] = {
+    "ticket_create": frozenset(
+        {"type", "title", "description", "conversationId", "impact", "urgency"}
+    ),
+    "ticket_get": frozenset({"ticketId", "number"}),
+    "ticket_list": frozenset({"status", "type", "limit"}),
+    "ticket_comment": frozenset({"ticketId", "number", "body", "visibility"}),
+}
+
+
+def allowed_arg_keys(tool_name: str) -> frozenset[str]:
+    """The keys this tool may be called with."""
+    return ALLOWED_TOOL_ARG_KEYS | TOOL_ARG_KEYS_EXTRA.get(tool_name, frozenset())
+
 
 @dataclass
 class RailVerdict:
@@ -177,7 +197,7 @@ def screen_tool_input(tool_name: str, args: dict[str, Any]) -> RailVerdict:
     if not settings.tool_rail_enabled:
         return RailVerdict(allowed=True)
 
-    unexpected = sorted(set(args) - ALLOWED_TOOL_ARG_KEYS)
+    unexpected = sorted(set(args) - allowed_arg_keys(tool_name))
     if unexpected:
         return RailVerdict(
             allowed=False, reason="TOOL_ARGUMENT_NOT_ALLOWED", matches=unexpected
