@@ -5,6 +5,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { useUIStore } from '@/lib/stores/ui.store'
 import { NewChatButton } from '@/features/conversation/components/NewChatButton'
 import { ThemeToggle } from '@/components/ThemeToggle'
+import { SidebarNav } from './SidebarNav'
 interface SidebarProps {
   children?: React.ReactNode // 里面会放历史会话列表
 }
@@ -34,6 +35,9 @@ export function Sidebar({ children }: SidebarProps) {
           {collapsed ? <PanelLeft className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
         </Button>
       </div>
+
+      {/* 主导航：对话 / 审批中心（带待办角标） */}
+      <SidebarNav collapsed={collapsed} />
 
       <div className="px-3 pb-3">
         <NewChatButton />

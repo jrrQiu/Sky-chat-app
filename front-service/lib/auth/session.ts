@@ -3,6 +3,11 @@ export interface AuthUser {
   email?: string
   name?: string
   image?: string
+  /**
+   * Roles issued with the token. Used only to decide which approval actions the UI
+   * offers — the server re-checks them on every decision.
+   */
+  roles?: string[]
 }
 
 export interface AuthSession {

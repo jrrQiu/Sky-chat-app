@@ -490,19 +490,8 @@ export const ChatService = {
     }
 
     try {
-      const apiMessages = useChatStore
-        .getState()
-        .messages.filter(
-          (message) => message.role !== 'assistant' || message.content.trim()
-        )
-        .map((message) => ({
-          role: message.role,
-          content: message.content,
-        }))
-
       const response = await requestChatResponse(
         {
-          messages: apiMessages,
           content,
           conversationId,
           model: store.selectedModel,
