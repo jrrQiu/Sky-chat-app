@@ -8,6 +8,7 @@ from app.knowledge.ingest import build_seed_index
 from app.knowledge.policy_search import retrieve_policy_evidence
 from app.persistence.knowledge_repository import PostgresKnowledgeRepository
 from app.retrieval.evidence import gate_evidence
+from app.retrieval.embedding import effective_retrieval_mode
 from app.retrieval.query import QueryPlan, understand_query, understand_query_with_model
 from app.retrieval.router import route_knowledge_bases
 from app.retrieval.types import RetrievalIndex, RetrievalResult
@@ -127,6 +128,10 @@ def run_retrieval(
     # as defence in depth.
     role_scope = frozenset((user_context or {}).get("roles", [])) if user_context else None
     index = build_seed_index(role_scope)
+    # Record the mode the run actually uses. With no dense provider the pipeline is
+    # lexical-only and says so, instead of fusing a stand-in that carries no
+    # semantic signal.
+    retrieval_mode = effective_retrieval_mode(embedding_provider)
     kb_keywords = _kb_keywords(index)
     if query_client is not None:
         plan = understand_query_with_model(
@@ -187,6 +192,7 @@ def run_retrieval(
 
     plan_payload = plan.to_dict()
     plan_payload["routed_kb_scopes"] = kb_ids
+    plan_payload["retrieval_mode"] = retrieval_mode
     plan_payload["retrieval_run"] = (
         {
             "task_type": plan.task_type,
@@ -230,4 +236,5 @@ def run_retrieval(
         tool_events=tool_events,
         issues=gate.issues,
         rail_blocked=rail_blocked,
+        retrieval_mode=retrieval_mode,
     )

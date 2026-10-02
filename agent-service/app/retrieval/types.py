@@ -11,6 +11,12 @@ from app.knowledge.models import (
     TicketEvent,
 )
 
+# Which retrieval channels a run actually used. `hybrid` means the dense channel
+# ran; `lexical_only` means the run was BM25 + sparse + exact, which is what an
+# unconfigured deployment gets instead of a fake semantic channel.
+RETRIEVAL_MODE_HYBRID = "hybrid"
+RETRIEVAL_MODE_LEXICAL_ONLY = "lexical_only"
+
 
 @dataclass
 class RetrievalIndex:
@@ -58,6 +64,9 @@ class RetrievalResult:
     issues: list[str] = field(default_factory=list)
     # Evidence quarantined by the retrieval rail (untrusted-content screening).
     rail_blocked: list[dict[str, Any]] = field(default_factory=list)
+    # The channels this run actually used, so a caller can tell a hybrid result
+    # from a lexical-only one without inspecting configuration.
+    retrieval_mode: str = RETRIEVAL_MODE_LEXICAL_ONLY
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -69,4 +78,5 @@ class RetrievalResult:
             "tool_events": self.tool_events,
             "issues": self.issues,
             "rail_blocked": self.rail_blocked,
+            "retrieval_mode": self.retrieval_mode,
         }

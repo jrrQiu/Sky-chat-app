@@ -70,7 +70,9 @@ def search_similar_tickets(
         if exact_hits:
             matched_by.append("exact")
         if similarity > 0:
-            matched_by.append("vector")
+            # This is a sparse cosine over token vectors, not a dense embedding comparison.
+            # Labelling it "vector" made ticket evidence claim a semantic match it never had.
+            matched_by.append("sparse")
         score = similarity * 3 + exact_hits + _recency_decay(ticket.closed_at) * 0.3
         if score <= 0:
             continue

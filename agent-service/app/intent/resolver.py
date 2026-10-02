@@ -5,7 +5,7 @@ from typing import Any
 
 from app.config import settings
 from app.intent.models import IntentResolution
-from app.intent.semantic import SemanticIntentClassifier
+from app.intent.semantic import get_semantic_classifier
 from app.intent.taxonomy import enabled_rules
 
 
@@ -179,7 +179,9 @@ def resolve_intent(
     if candidate is not None and float(candidate["confidence"]) >= HIGH_CONFIDENCE:
         selected = candidate
     else:
-        semantic = SemanticIntentClassifier().classify(text) if use_semantic else None
+        semantic = (
+            get_semantic_classifier().classify(text) if use_semantic else None
+        )
         if semantic is not None and (
             candidate is None or float(semantic["confidence"]) > float(candidate["confidence"])
         ):

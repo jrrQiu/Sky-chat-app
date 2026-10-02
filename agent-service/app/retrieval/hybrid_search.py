@@ -1,5 +1,16 @@
+"""Hybrid retrieval over policy chunks.
+
+Two lexical channels (BM25 and sparse cosine) and one exact-match channel always
+run; the dense channel is *added* on top when a real embedding provider is
+available. Treating dense as additive is deliberate: it used to replace the sparse
+channel even when the "dense" provider was a hash stand-in, which fused noise into
+the ranking, and a provider that fails mid-run must not be able to empty the result
+set either.
+"""
+
 from __future__ import annotations
 
+import logging
 import math
 from collections import Counter, defaultdict
 
@@ -9,6 +20,8 @@ from app.retrieval.embedding import dense_cosine_similarity
 from app.retrieval.fusion import reciprocal_rank_fusion
 from app.retrieval.rerank import rerank_policy_chunks
 from app.retrieval.types import RetrievalIndex, ScoredItem
+
+logger = logging.getLogger(__name__)
 
 
 def _document_frequency(chunks: list[KnowledgeChunk]) -> Counter[str]:
@@ -60,32 +73,63 @@ def bm25_rank(
     return ranked[:top_k]
 
 
-def vector_rank(
+def dense_rank(
     query: str,
     chunks: list[KnowledgeChunk],
     top_k: int,
-    embedding_provider=None,
+    embedding_provider,
 ) -> list[ScoredItem]:
-    if embedding_provider is not None:
-        query_embedding = embedding_provider.embed(query)
-        if query_embedding:
-            ranked: list[ScoredItem] = []
-            for chunk in chunks:
-                chunk_embedding = embedding_provider.embed(chunk.content)
-                if not chunk_embedding:
-                    continue
-                score = dense_cosine_similarity(query_embedding, chunk_embedding)
-                if score > 0:
-                    ranked.append(ScoredItem(item=chunk, score=score, matched_by="vector"))
-            ranked.sort(key=lambda candidate: candidate.score, reverse=True)
-            return ranked[:top_k]
+    """Dense (semantic) channel, or nothing when it cannot contribute.
 
+    An empty return means "no dense results", never "no results": the caller keeps
+    the lexical channels, so a provider that is absent, misconfigured or failing
+    degrades the run instead of wiping it out.
+    """
+    if embedding_provider is None:
+        return []
+
+    query_embedding = embedding_provider.embed(query)
+    if not query_embedding:
+        logger.warning(
+            "Dense embedding provider returned no vector for the query; "
+            "this retrieval run is lexical-only"
+        )
+        return []
+
+    ranked: list[ScoredItem] = []
+    for chunk in chunks:
+        chunk_embedding = embedding_provider.embed(chunk.content)
+        if not chunk_embedding:
+            continue
+        score = dense_cosine_similarity(query_embedding, chunk_embedding)
+        if score > 0:
+            ranked.append(ScoredItem(item=chunk, score=score, matched_by="vector"))
+
+    if not ranked:
+        logger.warning(
+            "Dense channel produced no candidate above zero similarity; "
+            "this retrieval run is lexical-only"
+        )
+    ranked.sort(key=lambda candidate: candidate.score, reverse=True)
+    return ranked[:top_k]
+
+
+def sparse_rank(
+    query: str,
+    chunks: list[KnowledgeChunk],
+    top_k: int,
+) -> list[ScoredItem]:
+    """Lexical sparse-cosine channel (bag-of-words overlap).
+
+    Labelled `sparse`, not `vector`: it has no embedding behind it, and calling it
+    a vector channel is what made a lexical-only run look like a dense one.
+    """
     query_vector = sparse_vector(query)
     ranked: list[ScoredItem] = []
     for chunk in chunks:
         score = cosine_similarity(query_vector, sparse_vector(chunk.content))
         if score > 0:
-            ranked.append(ScoredItem(item=chunk, score=score, matched_by="vector"))
+            ranked.append(ScoredItem(item=chunk, score=score, matched_by="sparse"))
 
     ranked.sort(key=lambda candidate: candidate.score, reverse=True)
     return ranked[:top_k]
@@ -137,19 +181,19 @@ def hybrid_retrieve_chunks(
     if not chunks:
         return []
 
-    bm25_candidates = bm25_rank(query, chunks, top_k=50)
-    vector_candidates = vector_rank(
-        query,
-        chunks,
-        top_k=50,
-        embedding_provider=embedding_provider,
-    )
-    exact_candidates = exact_rank(query, chunks, top_k=20)
+    ranked_lists = [
+        bm25_rank(query, chunks, top_k=50),
+        sparse_rank(query, chunks, top_k=50),
+        exact_rank(query, chunks, top_k=20),
+    ]
+    # Additive: with no provider, or one that yields nothing, the fusion below just
+    # sees an empty dense list and still ranks the lexical candidates.
+    if embedding_provider is not None:
+        ranked_lists.append(
+            dense_rank(query, chunks, top_k=50, embedding_provider=embedding_provider)
+        )
 
-    fused = reciprocal_rank_fusion(
-        [bm25_candidates, vector_candidates, exact_candidates],
-        k=60,
-    )
+    fused = reciprocal_rank_fusion(ranked_lists, k=60)
     document_map = {
         document.id: document for document in index.policy_documents
     }

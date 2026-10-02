@@ -219,6 +219,15 @@ class PostgresKnowledgeRepository:
                         },
                     )
 
+        # Writing knowledge invalidates any cached index, here as well as in the ingestion
+        # entry point: a caller that reaches this repository directly would otherwise leave a
+        # stale cache serving the pre-write content until its TTL expired. The import is local
+        # because `app.knowledge.ingest` imports this module at module level, so a top-level
+        # import back into it would be a cycle.
+        from app.knowledge.ingest import invalidate_index
+
+        invalidate_index()
+
     def load_index(self, roles: list[str] | None = None) -> RetrievalIndex:
         """Load the index, optionally scoped to a caller's roles.
 

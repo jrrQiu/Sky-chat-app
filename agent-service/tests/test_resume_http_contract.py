@@ -352,3 +352,9 @@ def test_ready_endpoint_reports_durability(client):
     assert checks["durable_checkpoints"] is False
     assert checks["caller_identity"] == "signed-jwt"
     assert checks["retrieval_rail"] is True
+    # Readiness must say what observability is really active, not imply an SDK
+    # instrumentation that is not installed.
+    observability = checks["observability"]
+    assert observability["registry"]["active"] is True
+    assert observability["otlp"]["auto_instrumentation"] is False
+    assert observability["langfuse"]["active"] is False

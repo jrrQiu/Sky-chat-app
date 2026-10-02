@@ -5,6 +5,8 @@ from fastapi import FastAPI
 from app.api.routes.approvals import router as approvals_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.health import router as health_router
+from app.api.routes.knowledge_admin import router as knowledge_admin_router
+from app.api.routes.metrics import router as metrics_router
 from app.api.routes.workflows import router as workflows_router
 from app.config import settings
 from app.core.security import internal_auth_problem
@@ -47,6 +49,8 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(approvals_router)
     app.include_router(workflows_router)
+    app.include_router(metrics_router)
+    app.include_router(knowledge_admin_router)
 
     return app
 

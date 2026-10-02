@@ -3,6 +3,9 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.knowledge.ingest import index_cache_state
+from app.intent.semantic import semantic_classifier_status
+from app.observability.tracing import observability_status
+from app.retrieval.embedding import describe_dense_channel
 
 router = APIRouter()
 
@@ -22,6 +25,7 @@ async def ready(request: Request):
     backend = getattr(request.app.state, "checkpoint_backend", None)
     graph = getattr(request.app.state, "graph", None)
     durable = backend == "postgres"
+    dense_channel = describe_dense_channel()
     checks = {
         "graph": graph is not None,
         "checkpoint_backend": backend,
@@ -33,7 +37,17 @@ async def ready(request: Request):
         ),
         "rate_limiting": settings.rate_limit_enabled,
         "retrieval_rail": settings.retrieval_rail_enabled,
+        # Which retrieval channels this deployment will really use, so "hybrid
+        # retrieval" is a claim an operator can verify rather than assume.
+        "retrieval_mode": dense_channel["mode"],
+        "dense_embeddings": dense_channel,
         "index_cache": index_cache_state(),
+        # What observability is actually active, so "traced" is verifiable.
+        "observability": observability_status(),
+        # Whether the intent classifier can really compare meaning. Without an embedding model
+        # it is unavailable and the rule/LLM paths decide, which an operator should be able to
+        # see rather than infer from a stale design document.
+        "intent_semantic": semantic_classifier_status(),
     }
     healthy = graph is not None and (durable or not settings.is_production)
     return JSONResponse(

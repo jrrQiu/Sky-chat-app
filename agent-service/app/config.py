@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     embedding_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
+    # `HashEmbeddingProvider` is a deterministic bag-of-tokens stand-in: its
+    # vectors carry no semantic signal, so fusing them makes "hybrid" retrieval
+    # worse than lexical-only. Opt-in for offline development and tests only; the
+    # service otherwise runs (and reports) lexical-only retrieval.
+    allow_hash_embeddings: bool = False
     model_context_window: int = 8192
     output_reserve: int = 1024
     context_safety_margin: int = 256
