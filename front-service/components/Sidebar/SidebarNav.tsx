@@ -1,7 +1,7 @@
 // components/Sidebar/SidebarNav.tsx
 import { useEffect } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { MessagesSquare, ShieldCheck, UsersRound } from 'lucide-react'
+import { MessagesSquare, ShieldCheck, Ticket, UsersRound } from 'lucide-react'
 import { useApprovalStore } from '@/features/approvals/store/approval.store'
 import { hasAdminRole } from '@/features/admin/types'
 import { useAuthStore } from '@/features/auth/store/auth.store'
@@ -34,8 +34,10 @@ export function SidebarNav({ collapsed }: SidebarNavProps) {
   }, [refreshBadge, location.pathname])
 
   // 成员管理只对管理员可见；服务端会对每个接口再校验一次角色。
+  // 工单对所有账号可见：请求人只会看到自己的工单。
   const items = [
     { to: '/chat', label: '对话', icon: MessagesSquare },
+    { to: '/tickets', label: '工单', icon: Ticket },
     { to: '/approvals', label: '审批中心', icon: ShieldCheck },
     ...(hasAdminRole(user?.roles)
       ? [{ to: '/admin/users', label: '成员管理', icon: UsersRound }]

@@ -6,6 +6,8 @@ import { ApprovalsPage } from '@/src/pages/ApprovalsPage'
 import { ChatConversationPage } from '@/src/pages/ChatConversationPage'
 import { ChatRedirectPage } from '@/src/pages/ChatRedirectPage'
 import { InviteAcceptPage } from '@/src/pages/InviteAcceptPage'
+import { TicketDetailPage } from '@/src/pages/TicketDetailPage'
+import { TicketsPage } from '@/src/pages/TicketsPage'
 
 export function App() {
   return (
@@ -41,6 +43,23 @@ export function App() {
           element={
             <AuthGuard>
               <AdminUsersPage />
+            </AuthGuard>
+          }
+        />
+        {/* 工单：列表 + 每个工单一个可分享的路由 */}
+        <Route
+          path="/tickets"
+          element={
+            <AuthGuard>
+              <TicketsPage />
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/tickets/:id"
+          element={
+            <AuthGuard>
+              <TicketDetailPage />
             </AuthGuard>
           }
         />
