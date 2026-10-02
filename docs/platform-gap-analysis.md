@@ -702,6 +702,65 @@ P0 轮已把 `lru_cache` 换成 TTL 缓存 + `invalidate_index()`，但**只有�
 - **通知**：状态变更目前不通知申请人（需要 L5 的出站模板）。
 - 前端**没有浏览器实测**，只有类型检查与样式对齐；`activityType` 的文案是尽力而为 + 原码兜底。
 
+---
+
+## 17. 工具层：从"能演"到"能用"（只做了工单）
+
+被问到"工具是否能够使用，不要像个 demo"时，先做的是**核实而不是辩解**。结论：**管线是真的，工具实现基本是假的**。
+
+### 17.1 核实结果（改动前）
+
+| 部分 | 真实状态 |
+|---|---|
+| 适配器抽象 + 真实 HTTP 适配器 | ✅ 真的：`OpenApiToolAdapter` 会真发 POST，带身份头与 `Idempotency-Key` |
+| 双层授权、工具护栏、幂等账本、审批门控、审计 | ✅ 真的 |
+| **工具实现** | ❌ **20+ 个工具返回硬编码字符串**，还编造标识符：`IT-IDP-10086`、`SW-2001`、年假固定 5 天、金额 `1280.00`、预算 `85000`、`AUD-<时间戳>`（什么都没写） |
+| **审批通过后的"执行"** | ❌ `finance_submit`/`vpn_api_provision` 返回一句"已提交/已开通"——审批链路真实，执行是字符串 |
+| **模型是否参与工具选择** | ❌ 全仓无 `tools=`/`tool_choice`/`tool_calls`；`select_tools_for_request` 用**正则**决定调什么 |
+
+### 17.2 本轮把工单工具做成真的
+
+选工单的理由：**两端都是我们的**，不必等第三方提供契约。
+
+| 改动 | 说明 |
+|---|---|
+| **反向内部令牌** | Python 回调 Java 时签发 `iss=sky-chat-agent-service` / `aud=sky-chat-java-service`，与 Java→Python 的 `iss`/`aud` **刻意相反**。若共用一个 pair，任何观察过出站令牌的一方都能把它回放给 Java 并以该用户身份行事（confused deputy）。两侧都校验两个 claim，令牌只会被它被寻址的那一方接受；测试直接断言"Java 签发的令牌回放到 Java 必须被拒" |
+| **Java 内部工具端点** | `POST /v1/internal/tools/{toolName}`，**复用 `TicketService`**，行为人取自令牌 `sub`。不在 Python 里重写可见性/状态机/矩阵（那会造出第二个必然漂移的策略点），也不让 Python 直接写表（那是第二条写路径） |
+| **失败即失败** | 连不上 Java 返回 `success=false` + `TICKET_SERVICE_UNAVAILABLE`（文案含"该操作未执行"），**绝不编造成功**；业务拒绝（无权限/不可见）是 HTTP 200 + `success=false`，让 agent 能对用户解释而不是报崩溃 |
+| **真实适配器 + 路由** | `TicketToolAdapter` 走 HTTP；`RoutingToolAdapter` 把工单工具派给它、其余回落到 mock，**并在结果里标 `simulated: true`** |
+| **工具与权限注册** | `agents.yaml` 声明哪些 agent 可用；`TOOL_PERMISSIONS` 声明哪些角色可用 |
+| **`/ready` 逐工具如实标注** | `implemented` / `declared_real`（已接给 agent）/ `declared_mock`（声明了但仍是桩）/ `implemented_not_wired`（有适配器但未接出），并声明 `routing: rule-based` |
+
+### 17.3 顺带修掉的四个缺陷（测试与实测抓出来的）
+
+| 缺陷 | 说明 |
+|---|---|
+| **意图分类法没有"报障"这一类** | 最要紧的一条：`我的打印机坏了` 匹配不到任何规则，fallback 到 `knowledge.retrieve`（conf 0.4），**永远走不到专家 agent，也就永远碰不到 `execute_tools`**——我把工具接在了一条这类输入永不经过的路径上。已补 `it.incident.report`（priority 75，排在 `it.service.request` 之前，因为"坏了"是故障不是请求）与 `support.ticket.status`（route 到 **service** agent，因为 knowledge 子图只检索不执行工具）；同时给 `it.service.request` 补了 `显示器/键盘/鼠标/打印机` 等常见名词 |
+| **agent 级权限被放宽** | `authorize_agent` 是"用户拥有该 agent 所需权限中的**任意一个**"。我往 agent 的 `permissions` 里加了 `ticket:read` 这类**广泛持有**的权限，于是 `hr_user` 突然能进 `network` agent。权限行已移除，工单授权只放 `TOOL_PERMISSIONS`，并在 `agents.yaml` 写明这个陷阱 |
+| **`TOOLS_BY_AGENT` 导致无条件选中** | 我先把工单工具加进了那张表，而它是"该 agent 的基础工具集"——等于**无条件选中**，于是"今天天气怎么样"也会建工单。工单工具改为只由条件化选择产生 |
+| **`"me"` 被当字面量传给 SQL** | `InternalToolController` 把 `requesterId="me"` 直接交给服务，而 `TicketService` 拿它做 SQL 相等过滤（`"me"` 的解析在控制器层）。这个工具会**永远返回 0 条**；已改为传 `actor.userId()` |
+
+另有一条**测试自身的教训**：实时脚本跨次尝试复用了同一个 runId，而 `ChatStreamService` 对已存在的 runId **重放已存事件、不再执行**——第二次跑出来的"结果"其实是第一次（规则修好前）的事件。这是 SSE 恢复/幂等该有的行为；脚本已改用唯一 runId，并把这个重放语义**固化成断言**。
+
+### 17.4 验证
+
+| 层次 | 结果 |
+|---|---|
+| Java 单测 | **214 项全绿**（新增 19：反向令牌 9——含回放拒绝、错 iss/aud、过期、错密钥、无 subject、无密钥；内部工具端点 10——含行为人取自令牌、业务拒绝是工具结果、未知工具、信封兼容、按编号解析经可见列表） |
+| Python 单测 | **246 项全绿**（新增 24：令牌 iss/aud 相反、请求构造、连不上不编造成功、401 归因配置、路由分流与 `simulated`、工具状态、参数推断、选择启发式、capabilities 不选工单） |
+| 实时端到端 | **27 项通过 / 0 失败**：一句话故障描述 → `ticket_create` → **`ticket` 表真实落行 #14** → 申请人是令牌 `sub` → `source=chat` → 时间线 actor 是该员工 → 审计 `origin=agent, tool=ticket_create`；追问"我的工单" → `ticket_list` 返回 #14 且**未重复建单**；runId 复用走重放；`/ready` 如实标注 |
+| 前端 / 数据库 | `tsc` 0 错误；schema 漂移 PASS |
+
+一次真实对话里**两个方向的内部令牌都被压到了**：Java 签发 Java→Python 令牌 → Python 校验 → Python 签发 Python→Java 令牌 → Java 校验。
+
+### 17.5 仍未做（诚实清单）
+
+- **没有 function calling**：工具仍由正则/规则选择。要真正让模型自主选工具需要接 function calling 并把参数交给模型；届时我会把 `routing` 从 `rule-based` 改成 `model`，不会两边都声称。
+- **`ticket_get` / `ticket_comment` 有真适配器但没接出去**：`ticket_get` 的能力目前通过 `ticket_list` 的编号检索 + 可见性过滤实现；`ticket_comment` 需要可靠地从自然语言解析"回复内容"，我没有硬猜。
+- **其余 20+ 个工具仍是桩**，只是现在**会自我标注**（`simulated: true`）、`/ready` 列明、`agents.yaml` 顶部也写明。接真需要目标系统的地址与契约（`OpenApiToolAdapter` 期望 `POST {base}/{tool}` 返回 `{success,text}`），或像工单这样写第一方适配器。
+- **高风险 `it`/`hr` 的 `pending_action` 仍是 mock**：`prepare_approval` 按 agent 硬编码映射，`it`/`hr` 会落到 `approval_decision` → mock 返回"审批流程已完成"。这条与工单无关但同属"假执行"，需要一并修。
+- **前端还没把 `simulated` 显示出来**：事件里已带该标志，聊天界面尚无"模拟数据"角标。
+
 
 
 
