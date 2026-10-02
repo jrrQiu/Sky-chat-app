@@ -1,0 +1,270 @@
+version: 1
+rules:
+  - id: platform.capabilities
+    priority: 10
+    enabled: true
+    domain: platform
+    operation: query
+    intent: platform.capabilities.query
+    agent_id: knowledge
+    action: capabilities
+    risk: low
+    confidence: 0.99
+    pattern: (你可以做什么|你能做什么|能帮我做什么|有什么功能|功能列表|who are you|what can you do|^帮助$|^help$)
+    plan:
+      - list_agent_capabilities
+    examples:
+      - 你能做什么
+      - 有什么功能
+
+  - id: approval.policy_query
+    priority: 20
+    enabled: true
+    domain: approval
+    operation: query
+    intent: approval.policy.query
+    agent_id: knowledge
+    action: query
+    risk: low
+    confidence: 0.97
+    pattern: (审批|approval).*(制度|流程|规则|是什么|怎么|如何|条件|要求)|(制度|流程|规则|条件).*(审批|approval)
+    plan:
+      - retrieve_policy
+      - answer_with_citations
+    examples:
+      - 审批流程是什么
+      - 审批规则有哪些
+
+  - id: network.vpn.policy_query
+    priority: 30
+    enabled: true
+    domain: network
+    operation: query
+    intent: network.vpn.policy_query
+    agent_id: knowledge
+    action: query
+    risk: low
+    confidence: 0.97
+    pattern: (vpn|内网|外网|网络访问).*(制度|流程|规则|是什么|怎么|如何|条件|要求)|(制度|流程|规则|条件).*(vpn|内网|外网|网络访问)
+    plan:
+      - retrieve_policy
+      - answer_with_citations
+    examples:
+      - VPN 制度是什么
+      - 外网访问需要什么条件
+
+  - id: finance.policy_query
+    priority: 31
+    enabled: true
+    domain: finance
+    operation: query
+    intent: finance.policy.query
+    agent_id: knowledge
+    action: query
+    risk: low
+    confidence: 0.97
+    pattern: (报销|发票|付款|预算|采购).*(制度|流程|规则|是什么|怎么|如何|条件|要求)|(制度|流程|规则|条件).*(报销|发票|付款|预算|采购)
+    plan:
+      - retrieve_policy
+      - answer_with_citations
+    examples:
+      - 报销制度是什么
+      - 发票要求有哪些
+
+  - id: hr.policy_query
+    priority: 32
+    enabled: true
+    domain: hr
+    operation: query
+    intent: hr.policy.query
+    agent_id: knowledge
+    action: query
+    risk: low
+    confidence: 0.97
+    pattern: (请假|年假|病假|入职|证明).*(制度|流程|规则|是什么|怎么|如何|条件)|(制度|流程|规则|条件).*(请假|年假|病假|入职|证明)
+    plan:
+      - retrieve_policy
+      - answer_with_citations
+    examples:
+      - 请假流程是什么
+      - 年假制度
+
+  - id: knowledge.ticket_investigation
+    priority: 25
+    enabled: true
+    domain: knowledge
+    operation: investigate
+    intent: knowledge.ticket.investigation
+    agent_id: knowledge
+    action: query
+    risk: low
+    confidence: 0.95
+    pattern: (历史工单|工单|案例|排查|故障|报错|错误码|被拒|无法登录|超时|失败).*(vpn|密码|财务|系统|网络|设备)|(vpn|密码|财务|系统|网络|设备).*(历史工单|工单|案例|排查|故障|报错|错误码|被拒|无法登录|超时|失败)
+    plan:
+      - understand_fault_signature
+      - ticket.search_similar
+      - ticket.get_timeline
+      - evidence_gate
+      - answer_with_citations
+    examples:
+      - 财务系统 VPN 被拒怎么排查
+
+  - id: hr.leave.query
+    priority: 50
+    enabled: true
+    domain: hr
+    operation: query
+    intent: hr.leave.query
+    agent_id: hr
+    action: query
+    risk: low
+    confidence: 0.98
+    pattern: (年假|剩余假期|剩余年假|请假.*(查询|余额|还有)|还有.*(天|年假|假期))
+    plan:
+      - retrieve_employee_leave_balance
+    examples:
+      - 我的年假还有多少天
+
+  - id: finance.reimbursement.query
+    priority: 51
+    enabled: true
+    domain: finance
+    operation: query
+    intent: finance.reimbursement.query
+    agent_id: finance
+    action: query
+    risk: low
+    confidence: 0.98
+    pattern: (报销.*(状态|进度|查询)|付款状态|发票状态|预算.*(查询|还有|剩余))
+    plan:
+      - query_erp
+      - check_payment_status
+    examples:
+      - 查询我的报销付款状态
+
+  - id: network.vpn.query
+    priority: 52
+    enabled: true
+    domain: network
+    operation: query
+    intent: network.vpn.query
+    agent_id: network
+    action: query
+    risk: low
+    confidence: 0.96
+    pattern: (vpn|wi-?fi|firewall|防火墙|内网|外网|网络访问).*(状态|查询|进度|是否|能不能|可用)
+    plan:
+      - query_cmdb
+      - query_permission
+    examples:
+      - VPN 状态
+
+  - id: approval.decision.request
+    priority: 60
+    enabled: true
+    domain: approval
+    operation: approve
+    intent: approval.decision.request
+    agent_id: approval
+    action: approve
+    risk: high
+    confidence: 0.96
+    pattern: (approval|审批|approve|reject|通过|拒绝|加签)
+    plan:
+      - load_rule
+      - create_approval_task
+      - wait_for_signal
+    examples:
+      - 帮我审批这个报销单
+
+  - id: network.vpn.request
+    priority: 70
+    enabled: true
+    domain: network
+    operation: submit
+    intent: network.vpn.request
+    agent_id: network
+    action: submit
+    risk: high
+    confidence: 0.95
+    pattern: (vpn|wi-?fi|firewall|防火墙|内网|外网|网络访问)
+    plan:
+      - retrieve_policy
+      - collect_slots
+      - create_approval
+      - execute_network_tool
+    examples:
+      - 我要在外网访问财务系统，帮我申请 VPN
+
+  - id: it.service.request
+    priority: 80
+    enabled: true
+    domain: it
+    operation: submit
+    intent: it.service.request
+    agent_id: it
+    action: submit
+    risk: medium
+    confidence: 0.95
+    pattern: (password|密码|解锁|unlock|software|软件|device|设备|install|安装|账号.*(锁|被锁|解锁))
+    plan:
+      - collect_slots
+      - check_permission
+      - execute_it_tool
+    examples:
+      - 账号被锁了
+
+  - id: hr.service.submit
+    priority: 90
+    enabled: true
+    domain: hr
+    operation: submit
+    intent: hr.service.submit
+    agent_id: hr
+    action: submit
+    risk: medium
+    confidence: 0.95
+    pattern: (leave|请假|onboarding|入职|certificate|证明|employee|员工|organization|组织)
+    plan:
+      - verify_employee
+      - collect_slots
+      - execute_hr_tool
+    examples:
+      - 我要请假
+
+  - id: finance.service.submit
+    priority: 91
+    enabled: true
+    domain: finance
+    operation: submit
+    intent: finance.service.submit
+    agent_id: finance
+    action: submit
+    risk: high
+    confidence: 0.95
+    pattern: (reimburs|报销|invoice|发票|budget|预算|purchase|采购|payment|付款)
+    plan:
+      - verify_policy
+      - collect_slots
+      - create_approval
+      - execute_finance_tool
+    examples:
+      - 我要提交一笔差旅报销发票
+
+  - id: knowledge.general
+    priority: 100
+    enabled: true
+    domain: knowledge
+    operation: query
+    intent: knowledge.retrieve
+    agent_id: knowledge
+    action: query
+    risk: low
+    confidence: 0.85
+    pattern: (policy|制度|sop|流程|history|历史|faq|常见问题|怎么|如何|what|how|是什么|为什么|区别)
+    plan:
+      - retrieve_policy
+      - retrieve_history
+      - answer_with_citations
+    examples:
+      - 这个流程怎么走

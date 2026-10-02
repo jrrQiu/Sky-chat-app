@@ -2,6 +2,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.context.models import ContextEnvelope
+
 
 class UserContext(BaseModel):
     userId: str
@@ -39,10 +41,11 @@ class ChatRequest(BaseModel):
     conversation_id: str
     user_message_id: str
     assistant_message_id: str
-    messages: list[ChatMessage]
+    messages: list[ChatMessage] = Field(default_factory=list)
     latest_user_message: str
     model: str | None = None
     api_key: str | None = None
     enable_thinking: bool = False
     enable_web_search: bool = False
+    context_envelope: ContextEnvelope | None = None
     agent_state: AgentStatePayload

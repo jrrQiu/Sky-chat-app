@@ -42,6 +42,11 @@ class OpenApiToolAdapter(ToolAdapter):
         if settings.tool_api_token:
             headers["Authorization"] = f"Bearer {settings.tool_api_token}"
 
+        # Forward the ledger key so the provider can deduplicate a replayed call.
+        idempotency_key = args.get("idempotency_key")
+        if idempotency_key:
+            headers["Idempotency-Key"] = str(idempotency_key)
+
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 f"{settings.tool_base_url.rstrip('/')}/{tool_name}",
@@ -49,7 +54,10 @@ class OpenApiToolAdapter(ToolAdapter):
                 json={"args": args, "state": state},
             )
             response.raise_for_status()
-            return response.json()
+            body = response.json()
+            if not isinstance(body, dict):
+                return {"success": True, "text": str(body)}
+            return body
 
 
 def get_tool_adapter() -> ToolAdapter:

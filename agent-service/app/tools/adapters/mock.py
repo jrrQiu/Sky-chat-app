@@ -3,7 +3,11 @@ import time
 from typing import Any
 
 from app.knowledge.base import format_knowledge_context, search_knowledge
-from app.persistence.approval_store import approval_store
+from app.persistence.approval_store import (
+    approval_id_for,
+    approval_key_for,
+    approval_store,
+)
 
 
 TOOLS_BY_AGENT: dict[str, list[str]] = {
@@ -75,18 +79,24 @@ async def execute_mock_tool(
         agent_id: str,
         pending_action: str,
     ) -> dict[str, Any]:
+        turn_id = str(state.get("turn_id") or state.get("request_id", ""))
+        key = approval_key_for(turn_id, pending_action)
         task = await approval_store.create(
-            task_id=f"approval_{int(time.time() * 1000)}",
+            task_id=approval_id_for(key),
             run_id=str(state.get("request_id", "")),
+            turn_id=turn_id,
+            thread_id=turn_id,
             user_id=str(state.get("user_id", "")),
             agent_id=agent_id,
             intent=state.get("intent"),
             risk_level=state.get("risk_level"),
             rule_id=rule_id,
+            approval_key=key,
             resume_payload={
                 "pending_action": pending_action,
                 "target_system": "finance-erp",
                 "request_id": str(state.get("request_id", "")),
+                "turn_id": turn_id,
             },
         )
         return {

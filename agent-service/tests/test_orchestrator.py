@@ -38,3 +38,10 @@ def test_classify_finance_submit():
     result = classify_request("我要提交一笔差旅报销发票")
     assert result["agent_id"] == "finance"
     assert result["intent"] == "finance.service.submit"
+
+
+def test_classify_ticket_investigation_routes_knowledge():
+    result = classify_request("财务系统 VPN 被拒怎么排查")
+    assert result["agent_id"] == "knowledge"
+    assert result["intent"] == "knowledge.ticket.investigation"
+    assert result["risk_level"] == "low"
