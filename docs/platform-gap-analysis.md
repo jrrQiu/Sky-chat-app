@@ -761,6 +761,72 @@ P0 轮已把 `lru_cache` 换成 TTL 缓存 + `invalidate_index()`，但**只有�
 - **高风险 `it`/`hr` 的 `pending_action` 仍是 mock**：`prepare_approval` 按 agent 硬编码映射，`it`/`hr` 会落到 `approval_decision` → mock 返回"审批流程已完成"。这条与工单无关但同属"假执行"，需要一并修。
 - **前端还没把 `simulated` 显示出来**：事件里已带该标志，聊天界面尚无"模拟数据"角标。
 
+---
+
+## 18. 高风险路径的假执行（已修）
+
+第 17 节末尾留下的那条"审批是真的、执行是假的"，本轮修掉了。
+
+### 18.1 缺陷的确切形状
+
+```python
+pending_action = {"network": "vpn_api_provision", "finance": "finance_submit"}
+                 .get(selected_agent, "approval_decision")     # 按 agent 猜动作名
+...
+"vpn_api_provision": lambda: {"success": True,
+    "text": "VPN 审批已通过，账号和配置已开通。",                  # 硬编码成功
+    "data": {"provisioned": True, "vpn_account": "vpn-user-001"}}
+```
+
+三点问题：动作名是**猜的**（`it`/`hr` 会拿到一个根本不对应的 `approval_decision`）；返回值是**写死的成功**；`verify_result` 还会无条件说"写操作已完成，正在核对执行结果"。因为审批**确实**发生了，这段文案读起来就像确认。
+
+### 18.2 改法
+
+| 改动 | 说明 |
+|---|---|
+| **写操作注册表** `app/tools/actions.py` | 把"这个动作有没有接入目标系统"变成可查询的事实。`external_implemented`（外部系统是否接入）与 `records_change_ticket`（是否在我们自己的系统留痕）是**两件独立的事**，此前被混成了一句文案 |
+| **动作由意图推导** | `pending_action` 不再按 agent 猜，而是按 intent 映射（`network.vpn.request → vpn_api_provision`）。没有对应动作的意图（如 `approval.decision.request`）**就是** `None`——"没有外部动作"是一个真答案，编造一个才是缺陷来源 |
+| **未接入就绝不调适配器** | 外部动作未接入时**不调用**适配器，直接返回 `success=false` + `ACTION_NOT_IMPLEMENTED`，文案明确指出"该动作未执行" |
+| **可达成的那一半是真的** | 通过**同一套 Java 工单接口**创建一张真实的**变更单**（`type=change`），把审批单 id、意图、原始请求写进描述。这是登记，**不是**开通，文案把两者分得很清楚 |
+| **账本记为 failed** | `success=false` 让账本落为 `failed`。只有 `succeeded` 才会短路，所以等目标系统接入后**仍可重试**，而不是这次审批被永久标记为已完成 |
+| **审计如实** | `tool.write` 记录 `outcome=failure`、`external_executed=false`、`error=ACTION_NOT_IMPLEMENTED`、`change_ticket_number` |
+| **`verify_result` 不再谎报** | 写失败时说"写操作未成功执行：…"，无动作时说"本次没有需要执行的外部动作" |
+| **删除假成功处理器** | mock 里 `vpn_api_provision`/`finance_submit`/`approval_decision` 三个处理器替换为 `implemented_write_refusal()`，即使被直接调用也只能返回失败 |
+| **护栏改为按工具声明 schema** | 建变更单需要 `type`/`title`/`description`，但共享白名单拒绝它们。没有放宽全局白名单（那会同时松动其它所有工具），而是让工具声明自己的 schema（`TOOL_ARG_KEYS_EXTRA`），其它工具仍然拒绝任何自造参数 |
+| **`/ready` 增加 `write_actions`** | `externalExecutionAvailable: false` 与逐个动作的 `externalImplemented`，运维不必读源码就知道"审批会通过，执行不会发生" |
+
+### 18.3 顺带发现
+
+| 发现 | 说明 |
+|---|---|
+| **审批键可能算出两个** | `prepare_approval` 与 mock 的 `approval_result` 各自用 `approval_key_for(turn_id, action)`，而动作名来源不同；一旦不一致，**同一轮会生成两张审批单**。已统一到 `action_key(intent)`，两边不可能分歧 |
+| **被拒的写动作没有审计** | 批准后的写动作若被 RBAC 拒绝，原先直接返回、**不写审计**——于是"批准了但什么都没发生"在审计里不留痕迹。现已记录 `outcome=denied` + `reason=RBAC_DENIED` |
+| **执行用的是申请人权限，不是审批人权限** | 这是**既有策略**，我没有在无告知的情况下改动：审批是加一道签名，**不是**授予申请人原本没有的权限（否则审批就成了提权通道）。附带后果值得记录：`employee` 角色连 `network` agent 都进不去（`authorize_agent` 是 any-of 判定），所以纯员工**根本无法发起** VPN 申请，也就永远走不到审批。这是权限姿态问题，不是本轮缺陷 |
+| **恢复结果未持久化** | 实测中 `approval_task.resume_state=succeeded` 而 `result` 为 `None`。审批动作到底做了什么，目前**只能从审计与账本行还原**；`result` 这一列不可依赖。已记录，未修 |
+
+### 18.4 验证
+
+| 层次 | 结果 |
+|---|---|
+| Java 单测 | **214 项全绿** |
+| Python 单测 | **262 项全绿**（新增 16：注册表解析、无动作即 None、文案区分"登记/执行"、旧动作名只能失败、护栏未被全局放宽、未接入不调适配器、变更单参数与关联、审计失败与未执行、无动作分支、开关关闭、RBAC 仍拦截、`verify_result` 如实） |
+| 实时端到端 | **34 项通过 / 0 失败**，两个场景 |
+| 前端 / 数据库 | `tsc` 0 错误；schema 漂移 PASS |
+
+实时结果（真实 PostgreSQL 与两个服务）：
+
+- **场景 A（申请人有写权限）**：审批单 `pending_action=vpn_api_provision`（取自意图）→ 批准 → 恢复无错 → 事件与恢复结果里**没有任何**"已开通/账号和配置"字样 → **真实变更单 #15**（关联审批单 id、标注"尚未接入"）→ 账本 `vpn_api_provision = failed` → 审计 `failure / external_executed=false / ACTION_NOT_IMPLEMENTED / change_ticket_number=15`。
+- **场景 B（申请人无写权限）**：批准成功但写动作被 RBAC 拒 → 审计 `denied / RBAC_DENIED / external_executed=false` → 不建变更单 → 也不谎称已开通。
+
+另有一条**测试自身的问题**被修掉：`test_approval_checkpoint_protocol` 等三个测试断言"适配器被调用过 1 次"以验证恰好执行一次，而默认注册表里所有动作都未接入、按设计不调适配器，断言会变得**空洞**。现在这些测试显式把动作标记为已接入并让替身像真目标系统那样返回成功，断言重新具备意义。
+
+### 18.5 仍未做（诚实清单）
+
+- **外部系统仍然没有接入**：这是 `external_implemented=False` 的字面含义。接入 VPN/ERP 需要各自的地址与契约，在那之前"审批通过 → 未执行"就是正确行为。
+- **变更单只是登记**，不等于开通；描述里已写明，但产品话术上仍需注意别把它说成"已开通"。
+- **`approval_task.result` 不可依赖**（见 18.3），恢复结果的持久化待查。
+- **高风险只覆盖 `network.vpn.request` 与 `finance.service.submit`** 两类意图；`it`/`hr` 目前没有高风险意图，因此没有对应写动作。
+
 
 
 
