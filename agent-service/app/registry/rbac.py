@@ -6,51 +6,86 @@ from app.registry.registry import get_agent
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "employee": {
         "knowledge:read",
+        # Anyone may raise and follow up their own ticket. Which tickets they can
+        # actually see is decided by the Java service, not by this permission.
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "it_user": {
         "it:password_reset",
         "it:device:read",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "it_staff": {
         "it:password_reset",
         "it:device:read",
         "it:software:install",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "network_user": {
         "network:vpn:read",
         "network:access:read",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "network_admin": {
         "network:vpn:read",
         "network:vpn:create",
         "network:access:read",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "hr_user": {
         "hr:leave:read",
         "hr:onboarding:read",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "hr_staff": {
         "hr:profile:read",
         "hr:leave:read",
         "hr:onboarding:read",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "finance_user": {
         "finance:invoice:read",
         "finance:budget:read",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "approver": {
         "approval:read",
         "approval:create",
+        "ticket:read",
+        "ticket:create",
+        "ticket:comment",
     },
     "auditor": {
         "knowledge:read",
         "audit:write",
         "policy:enforce",
+        # Read-only oversight: may look, may not raise or reply through the agent.
+        "ticket:read",
     },
 }
 
 
 TOOL_PERMISSIONS: dict[str, set[str]] = {
+    "ticket_create": {"ticket:create"},
+    "ticket_comment": {"ticket:comment"},
+    "ticket_get": {"ticket:read"},
+    "ticket_list": {"ticket:read"},
     "agent_registry": {"agent:select"},
     "policy_api": {"run:read"},
     "idp": {"it:password_reset"},

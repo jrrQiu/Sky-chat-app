@@ -56,7 +56,12 @@ public class JwtAuthFilter implements WebFilter {
                 // token. They are matched exactly: a prefix match would also have opened
                 // every sibling route under /v1/auth/invitations.
                 || "/v1/auth/invitations/accept".equals(path)
-                || "/v1/auth/invitations/preview".equals(path)) {
+                || "/v1/auth/invitations/preview".equals(path)
+                // Server-to-server tool calls carry a token addressed to this service
+                // (iss=agent-service, aud=java-service) rather than an end-user token, so the
+                // user-token check below cannot apply. InternalToolController verifies that
+                // credential itself, and requires both claims.
+                || path.startsWith("/v1/internal/")) {
             return chain.filter(exchange);
         }
 

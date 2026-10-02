@@ -5,6 +5,7 @@ from app.config import settings
 from app.knowledge.ingest import index_cache_state
 from app.intent.semantic import semantic_classifier_status
 from app.observability.tracing import observability_status
+from app.tools.adapters import tool_status
 from app.retrieval.embedding import describe_dense_channel
 
 router = APIRouter()
@@ -48,6 +49,9 @@ async def ready(request: Request):
         # it is unavailable and the rule/LLM paths decide, which an operator should be able to
         # see rather than infer from a stale design document.
         "intent_semantic": semantic_classifier_status(),
+        # Which tools are integrations and which are still placeholders, so nobody has to read
+        # the source to find out that IdP/MDM/HRIS/ERP are stubs.
+        "tools": tool_status(),
     }
     healthy = graph is not None and (durable or not settings.is_production)
     return JSONResponse(

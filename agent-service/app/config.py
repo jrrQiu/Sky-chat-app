@@ -26,6 +26,16 @@ class Settings(BaseSettings):
     # Development-only escape hatch for the legacy static shared token.
     allow_static_internal_token: bool = False
 
+    # --- calling back into Java (tool execution) --------------------------
+    # The reverse direction uses the SAME shared secret but the opposite
+    # issuer/audience pair, so a token minted here is only ever accepted by
+    # Java and a token Java minted for us cannot be replayed back at it.
+    java_service_base_url: str = "http://localhost:8080"
+    agent_caller_issuer: str = "sky-chat-agent-service"
+    java_service_audience: str = "sky-chat-java-service"
+    agent_caller_ttl_seconds: int = 60
+    tool_timeout_seconds: float = 30.0
+
     # --- rate limiting ----------------------------------------------------
     rate_limit_enabled: bool = True
     rate_limit_prefix: str = "rl"
@@ -65,6 +75,10 @@ class Settings(BaseSettings):
     tool_provider: str = "mock"
     tool_base_url: str = ""
     tool_api_token: str = ""
+    # Whether a problem described in chat automatically raises a real ticket. On by
+    # default because that is the point of a service desk, but an operator can turn
+    # it off without losing the ticket tools themselves.
+    ticket_auto_create_from_chat: bool = True
 
     retrieval_use_llm: bool = False
     retrieval_use_postgres: bool = False

@@ -28,6 +28,22 @@ public class InternalTokenService {
     public static final String AUDIENCE = "sky-chat-agent-service";
     public static final long TTL_SECONDS = 60L;
 
+    /**
+     * The reverse direction: the agent service calling back into Java.
+     *
+     * <p>Deliberately a different issuer/audience pair from {@link #ISSUER}/{@link #AUDIENCE}.
+     * Reusing one pair would make a token Java minted for Python replayable against Java's own
+     * internal endpoints — the classic confused-deputy hole. Because the pairs are distinct and
+     * each side checks both claims, a token is only ever accepted by the service it was minted
+     * for.</p>
+     */
+    public static final String CALLER_ISSUER = "sky-chat-agent-service";
+    public static final String CALLER_AUDIENCE = "sky-chat-java-service";
+
+    /** Who the agent service is acting as, taken from the signed subject. */
+    public record AgentCaller(String userId, List<String> roles) {
+    }
+
     private final AgentInternalProperties properties;
     private final JwtSigner signer;
 
@@ -81,6 +97,35 @@ public class InternalTokenService {
             throw new IllegalArgumentException("Token is not an internal agent-service token");
         }
         return claims;
+    }
+
+    /**
+     * Verifies a token the agent service presents when it calls back into Java.
+     *
+     * <p>Both claims are checked, so a token Java minted for the agent service (issuer
+     * {@code sky-chat-java-service}, audience {@code sky-chat-agent-service}) is rejected here
+     * even though it carries a valid signature: it was addressed to somebody else. Without that
+     * check, anything that could observe an outbound token could present it back to Java and act
+     * as the user it named.</p>
+     *
+     * @throws IllegalArgumentException when the token is malformed, expired, signed with another
+     *                                  secret, or addressed to a different service
+     */
+    public AgentCaller verifyAgentCaller(String token) {
+        String secret = secret();
+        if (secret == null) {
+            throw new IllegalStateException("AGENT_INTERNAL_JWT_SECRET is not configured");
+        }
+        JwtSigner.Token claims = signer.verify(secret, token);
+        if (!CALLER_ISSUER.equals(claims.issuer()) || !CALLER_AUDIENCE.equals(claims.audience())) {
+            throw new IllegalArgumentException(
+                    "Token is not addressed to this service as an agent caller"
+            );
+        }
+        if (claims.subject() == null || claims.subject().isBlank()) {
+            throw new IllegalArgumentException("Agent caller token has no subject");
+        }
+        return new AgentCaller(claims.subject(), claims.roles());
     }
 
     public boolean isConfigured() {

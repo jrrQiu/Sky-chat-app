@@ -2,6 +2,7 @@ import re
 import time
 from typing import Any
 
+from app.config import settings
 from app.knowledge.base import format_knowledge_context, search_knowledge
 from app.persistence.approval_store import (
     approval_id_for,
@@ -10,6 +11,12 @@ from app.persistence.approval_store import (
 )
 
 
+#: The *stub* tool set per agent. Ticket tools are deliberately NOT listed here:
+#: anything in this map is selected unconditionally for that agent, and a weather
+#: question must not raise a ticket. Ticket tools are added only by
+#: :func:`ticket_tools_for_message`, and their authorization comes from
+#: ``agents.yaml`` (which agent may use them) plus ``TOOL_PERMISSIONS`` (which user
+#: may).
 TOOLS_BY_AGENT: dict[str, list[str]] = {
     "orchestrator": ["agent_registry", "policy_api"],
     "it": ["idp", "mdm", "software_center"],
@@ -21,6 +28,51 @@ TOOLS_BY_AGENT: dict[str, list[str]] = {
     "guardian": ["rbac", "dlp", "audit_service"],
 }
 
+#: Tools implemented for real (they call the Java service). Everything else in
+#: ``TOOLS_BY_AGENT`` is still a stub, and results are marked ``simulated``.
+TICKET_TOOLS: tuple[str, ...] = ("ticket_create", "ticket_get", "ticket_list", "ticket_comment")
+
+#: The user asking about their own tickets rather than describing a new problem.
+_TICKET_STATUS_PATTERN = re.compile(
+    r"我的工单|我提的工单|工单(?:状态|进度|列表|情况)|处理到哪|什么进度|进展如何|"
+    r"my tickets?|ticket status",
+    re.I,
+)
+#: A ticket number the user wants looked up ("#12", "工单 12").
+_TICKET_NUMBER_PATTERN = re.compile(r"#\s*(\d+)|工单\s*(?:号|编号)?\s*(\d+)", re.I)
+#: Something to raise a ticket about.
+_SERVICE_ISSUE_PATTERN = re.compile(
+    r"坏了|损坏|故障|报障|报修|无法|不能|不可用|打不开|连不上|连不上|失败|异常|宕机|离线|"
+    r"报错|崩溃|申请|申领|开通|办理|重置|解锁|安装|"
+    r"broken|not working|error|fail|request|reset|install",
+    re.I,
+)
+
+
+def ticket_tools_for_message(user_message: str, available: list[str]) -> list[str]:
+    """Which ticket tools a message implies.
+
+    Rule-based on purpose: this service has no model function-calling, so the choice
+    is made here and reported as ``tool_routing: rule-based`` in ``/ready``. Kept
+    narrow so a message that is not about tickets never triggers one.
+    """
+    selected: list[str] = []
+    if _TICKET_STATUS_PATTERN.search(user_message) and "ticket_list" in available:
+        selected.append("ticket_list")
+        return selected
+    if _TICKET_NUMBER_PATTERN.search(user_message) and "ticket_list" in available:
+        # Look the number up first; ticket_get lives behind that lookup so an
+        # invisible ticket stays invisible.
+        selected.append("ticket_list")
+        return selected
+    if (
+        getattr(settings, "ticket_auto_create_from_chat", True)
+        and _SERVICE_ISSUE_PATTERN.search(user_message)
+        and "ticket_create" in available
+    ):
+        selected.append("ticket_create")
+    return selected
+
 
 def select_tools_for_request(
     agent_id: str,
@@ -28,6 +80,11 @@ def select_tools_for_request(
     action: str = "query",
 ) -> list[str]:
     tools = TOOLS_BY_AGENT.get(agent_id, [])
+    ticket_tools = (
+        ticket_tools_for_message(user_message, _declared_tools(agent_id))
+        if action != "capabilities"
+        else []
+    )
 
     if agent_id == "it":
         selected: list[str] = []
@@ -37,32 +94,40 @@ def select_tools_for_request(
             selected.append("software_center")
         if re.search(r"device|设备|fault|故障", user_message, re.I):
             selected.append("mdm")
-        return selected or tools
+        selected = selected or tools
+        return [*selected, *ticket_tools]
 
     if agent_id == "hr":
-        if action == "query":
-            return ["hris"]
-        return ["hris", "organization_service", "form_service"]
+        base = ["hris"] if action == "query" else ["hris", "organization_service", "form_service"]
+        return [*base, *ticket_tools]
 
     if agent_id == "network":
-        if action == "query":
-            return ["cmdb", "permission_system"]
-        return tools
+        base = ["cmdb", "permission_system"] if action == "query" else list(tools)
+        return [*base, *ticket_tools]
 
     if agent_id == "finance":
-        if action == "query":
-            return ["erp"]
         selected = ["erp"]
         if re.search(r"invoice|发票|ocr|票据", user_message, re.I):
             selected.append("ocr")
         if re.search(r"budget|预算|采购|purchase", user_message, re.I):
             selected.append("budget_service")
-        return selected
+        return [*selected, *ticket_tools]
 
     if agent_id == "knowledge":
-        return ["pgvector", "reranker"]
+        return ["pgvector", "reranker", *ticket_tools]
 
-    return tools
+    return [*tools, *ticket_tools]
+
+
+def _declared_tools(agent_id: str) -> list[str]:
+    """The tools the registry allows this agent to use.
+
+    Read from ``agents.yaml`` rather than from the stub map above, because that is
+    what ``can_agent_use_tool`` will enforce at execution time.
+    """
+    from app.registry.registry import get_agent
+
+    return list(get_agent(agent_id).get("tools", []))
 
 
 async def execute_mock_tool(

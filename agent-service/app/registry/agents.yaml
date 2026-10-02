@@ -1,4 +1,17 @@
 agents:
+  # NOTE ON TOOL HONESTY
+  # Only ticket_create / ticket_get / ticket_list / ticket_comment are implemented against a
+  # real system (the Java service). Every other tool name below is still a stub that returns
+  # canned text; the adapter marks those results `simulated: true` and `/ready` lists which is
+  # which under `tools.real` / `tools.mock`. Do not describe this deployment as integrated with
+  # IdP/MDM/HRIS/ERP until those adapters exist.
+  #
+  # NOTE ON `permissions`
+  # `authorize_agent` grants access when the user holds ANY of an agent's permissions, so these
+  # must stay specific to the agent (e.g. `network:*`). Adding a broadly-held permission such as
+  # `ticket:read` here would make the agent reachable by every role that holds it -- a widening
+  # that a unit test caught once already. Tool-level authorization belongs in
+  # `app/registry/rbac.py:TOOL_PERMISSIONS`, which is per-tool and needs no entry here.
   - id: orchestrator
     name: Orchestrator
     description: Classifies intent, assesses risk, and routes to specialist agents.
@@ -7,6 +20,7 @@ agents:
     tools:
       - agent_registry
       - policy_api
+      - ticket_list
     permissions:
       - agent:select
       - run:read
@@ -20,6 +34,8 @@ agents:
       - idp
       - mdm
       - software_center
+      - ticket_create
+      - ticket_list
     permissions:
       - it:password_reset
       - it:device:read
@@ -34,6 +50,8 @@ agents:
       - vpn_api
       - cmdb
       - permission_system
+      - ticket_create
+      - ticket_list
     permissions:
       - network:vpn:read
       - network:vpn:create
@@ -48,6 +66,8 @@ agents:
       - hris
       - organization_service
       - form_service
+      - ticket_create
+      - ticket_list
     permissions:
       - hr:profile:read
       - hr:leave:read
@@ -62,6 +82,8 @@ agents:
       - erp
       - ocr
       - budget_service
+      - ticket_create
+      - ticket_list
     permissions:
       - finance:invoice:read
       - finance:budget:read
@@ -75,6 +97,7 @@ agents:
       - pgvector
       - elasticsearch
       - reranker
+      - ticket_list
     permissions:
       - knowledge:read
 

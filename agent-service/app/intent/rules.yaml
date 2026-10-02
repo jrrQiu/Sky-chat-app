@@ -206,13 +206,62 @@ rules:
     action: submit
     risk: medium
     confidence: 0.95
-    pattern: (password|密码|解锁|unlock|software|软件|device|设备|install|安装|账号.*(锁|被锁|解锁))
+    pattern: (password|密码|解锁|unlock|software|软件|device|设备|install|安装|账号.*(锁|被锁|解锁)|显示器|键盘|鼠标|电脑|笔记本|工位|打印机|账号权限)
     plan:
       - collect_slots
       - check_permission
       - execute_it_tool
     examples:
       - 账号被锁了
+      - 申请一个显示器
+
+  # Fault reporting. Without this rule a description of something broken matched
+  # nothing and fell through to the knowledge fallback at confidence 0.4, which
+  # meant the service-desk path -- and therefore ticket creation -- was unreachable
+  # for the most common message a service desk receives.
+  #
+  # Priority 75 sits above `it.service.request` so a broken device is classified as an
+  # incident rather than a request (the two differ in ITSM), and below every
+  # policy-query rule. The pattern is deliberately fault words only: "申请" and
+  # "开通" are requests, not faults, and must not be captured here.
+  - id: it.incident.report
+    priority: 75
+    enabled: true
+    domain: it
+    operation: submit
+    intent: it.incident.report
+    agent_id: it
+    action: submit
+    risk: medium
+    confidence: 0.9
+    pattern: (坏了|损坏|故障|报障|报修|无法|不能|不可用|打不开|连不上|连不上|失败|异常|宕机|离线|报错|崩溃|not working|broken|down|outage)
+    plan:
+      - collect_slots
+      - check_permission
+      - execute_it_tool
+    examples:
+      - 我的打印机坏了
+      - 系统登录不了
+
+  # The user asking about their own tickets. Routed to a *service* agent on purpose:
+  # the knowledge subgraph only retrieves, it does not run tools, so a ticket lookup
+  # sent there would never execute.
+  - id: support.ticket_status
+    priority: 55
+    enabled: true
+    domain: it
+    operation: query
+    intent: support.ticket.status
+    agent_id: it
+    action: query
+    risk: low
+    confidence: 0.92
+    pattern: (我的工单|我提的工单|工单.*(状态|进度|列表|情况)|处理到哪|什么进度|进展如何|my tickets?|ticket status)
+    plan:
+      - list_my_tickets
+    examples:
+      - 我的工单现在是什么状态
+      - 我提的工单处理到哪了
 
   - id: hr.service.submit
     priority: 90
