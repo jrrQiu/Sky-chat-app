@@ -83,7 +83,32 @@ REDIS_PORT=6379
 AGENT_SERVICE_URL=http://localhost:8000
 AGENT_SERVICE_TOKEN=replace-with-internal-jwt
 JWT_SECRET=replace-with-a-long-random-secret
+INVITE_BASE_URL=http://localhost:5173/invite
+BOOTSTRAP_ADMIN_EMAIL=
 ```
+
+### 账号开通
+
+自助注册默认**关闭**（`AUTH_SELF_REGISTRATION_ENABLED=false`）：账号只能由管理员开通，
+或凭管理员发出的**一次性邀请链接**设置密码。
+
+全新部署的第一个管理员这样创建：把 `BOOTSTRAP_ADMIN_EMAIL` 设成你的邮箱后启动 Java 服务。
+当库里没有任何在用的管理员时，启动日志会打印一条管理员邀请链接（只打印一次），
+用浏览器打开它设置密码即可。之后在「成员管理」页里继续邀请其他人。
+
+```powershell
+$env:BOOTSTRAP_ADMIN_EMAIL = "you@example.com"
+cd java-service; mvn spring-boot:run   # 从日志里复制邀请链接
+```
+
+要点：
+
+- 邀请令牌只以 SHA-256 形式入库，链接一旦生成就无法再取回；重新发送会给同一邮箱
+  换发新链接并**作废旧链接**。
+- 邀请默认 72 小时过期（`INVITE_TTL_HOURS`），且只能用一次。
+- 被邀请人不能自选角色，角色来自邀请本身。
+- 管理员可以停用账号，停用**立即生效**（每次请求都会校验账号状态），不必等 JWT 过期。
+- 最后一个管理员既不能被降权也不能被停用。
 
 Agent 服务主要变量：
 

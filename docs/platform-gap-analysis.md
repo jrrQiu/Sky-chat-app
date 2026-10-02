@@ -550,5 +550,35 @@ AI 部分（编排、检索、审批恢复）已经是相对领先的一块，�
 
 后端为支撑该界面补了三处：`GET /v1/approvals?scope=mine|to_approve|all`（待办队列的角色规则与决策接口**完全一致**，所以界面不会出现"点了却被拒"的按钮）、`GET /v1/approvals/{id}/decisions`（轨迹）、登录响应返回 `roles`。
 
+---
+
+## 14. 方案 A：管理员开户 + 邀请制（消除"关掉注册后无法开户"的运营断点）
+
+§12 的 #1 把自助注册关掉之后留下了一个断点：**新员工无法开户，分配角色只能改数据库**。本节补上替代路径。
+
+| 能力 | 实现 | 关键性质 |
+|---|---|---|
+| 首个管理员 | `BOOTSTRAP_ADMIN_EMAIL` + 启动时无管理员则签发一条 admin 邀请，链接只在日志打印一次 | **不在配置里放密码**；复用邀请机制，凭据始终不经过环境变量或日志 |
+| 邀请开关 | `AUTH_SELF_REGISTRATION_ENABLED=false`（默认） | 403 `SELF_REGISTRATION_DISABLED` |
+| 邀请签发 | `POST /v1/auth/invitations`（管理员） | 令牌只存 SHA-256；明文只在响应里出现一次 |
+| 邀请接受 | `GET /v1/auth/invitations/preview`、`POST /v1/auth/invitations/accept`（公开） | 一次性（CAS 消费）、72 小时过期（可调）、可撤销；**角色来自邀请，被邀请人不能自选** |
+| 成员管理 | `GET/POST /v1/admin/users`、`PATCH .../roles`、`POST .../disable\|enable`、`GET /v1/admin/roles` | 分页检索；角色白名单校验 |
+| 权限边界 | `admin` 与 `user_admin` 分离 | `user_admin` 可开户但**不能授予管理员角色**（否则委派形同虚设） |
+| 自我保护 | 最后一个管理员不可降权/停用；不可停用自己 | 防止把自己锁在门外 |
+| 停用即时生效 | 每次请求校验账号状态 | JWT 无法撤销，否则"停用"按钮等于装饰 |
+| 审计 | `user.create` / `user.roles_changed` / `user.disable` / `user.enable` / `invitation.send` / `invitation.revoke` / `invitation.accept` / `user.bootstrap_admin` | 被拒的操作也记 `denied` |
+
+**做这件事时又发现并修掉四个缺陷**（前两个由单元测试、后两个由实时端到端验证发现）：
+
+1. `countAdministrators` 原本用 `roles LIKE '%admin%'`，会把 `network_admin` 也算成管理员 → 改为 CSV 精确 token 匹配。
+2. `JwtAuthFilter` 里 `Mono.fromCallable` 对已删除账号返回 `null` 会变成**空 Mono**，导致既不继续链路也不写响应（返回一个没有状态的空响应）→ 加 `switchIfEmpty`。
+3. **"最后一个管理员"保护过弱**：`user_admin` 也被计入管理员数，所以只要存在一个 `user_admin`，最后一个**真正的 admin** 就能被降权——结果没人能再授予管理员角色，正是这个守卫要防的死锁。→ 区分"能管理员"与"能授予管理员角色"，降权/停用 `admin` 时按 `countFullAdministrators` 判断。
+4. **角色变更不即时生效**（比第 3 点更严重）：JWT 里的角色是签发时写死的，所以被降权的管理员**仍然保有一个长达 7 天的管理员 token**；停用是即时生效的，降权却不是。→ 让过滤器用**数据库里的当前角色**而不是 token 里的角色（同一次查询，零额外成本），停用与降权都在下一个请求生效。
+
+第 3、4 点单测发现不了——它们需要"两个管理员 + 一个 user_admin + 两次登录"这种真实状态组合，是我跑端到端脚本时暴露出来的。
+
+**仍未做**：邮箱验证与验证码/反自动化（§13 的 B）、注册限流的 fail-closed 分层（§13 的 C）、成员管理之外的密码重置流程。
+
+
 
 
