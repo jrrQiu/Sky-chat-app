@@ -13,7 +13,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public record SecurityProperties(
         Auth auth,
         Http http,
-        Audit audit
+        Audit audit,
+        Invite invite,
+        Bootstrap bootstrap
 ) {
     public record Auth(boolean selfRegistrationEnabled) {
     }
@@ -26,5 +28,30 @@ public record SecurityProperties(
      * service itself never deletes audit rows.
      */
     public record Audit(int retentionMonths) {
+    }
+
+    /**
+     * Invitations replace open registration.
+     *
+     * @param baseUrl where the invite link should point, i.e. the front-end route that
+     *                renders the set-password page. The raw token is appended as
+     *                {@code ?token=}; it is never logged by the service.
+     * @param ttlHours default validity, clamped to {@code [1, 720]}; a caller may override
+     *                it per invitation. Re-issuing for the same address revokes any earlier
+     *                pending link, so only one link is ever live.
+     */
+    public record Invite(String baseUrl, int ttlHours) {
+    }
+
+    /**
+     * First-administrator bootstrap. When {@code adminEmail} is set and no active
+     * administrator exists, startup issues an ordinary invitation for that address with
+     * the {@code admin} role and logs the link.
+     *
+     * <p>Deliberately no password field: a password in an environment variable would have
+     * to be transmitted, stored and rotated, whereas the invite flow already gives the
+     * operator a one-time link and keeps the credential out of configuration entirely.</p>
+     */
+    public record Bootstrap(String adminEmail) {
     }
 }

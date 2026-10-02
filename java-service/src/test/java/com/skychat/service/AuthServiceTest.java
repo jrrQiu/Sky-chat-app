@@ -3,16 +3,15 @@ package com.skychat.service;
 import com.skychat.config.AuthProperties;
 import com.skychat.config.SecurityProperties;
 import com.skychat.domain.UserAccount;
-import com.skychat.mapper.UserMapper;
 import com.skychat.service.ratelimit.InMemoryRateLimitStore;
 import com.skychat.service.ratelimit.RateLimiter;
 import com.skychat.service.ratelimit.RedisRateLimitStore;
+import com.skychat.support.InMemoryUserMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
@@ -53,7 +52,9 @@ class AuthServiceTest {
                 new SecurityProperties(
                         new SecurityProperties.Auth(selfRegistrationEnabled),
                         new SecurityProperties.Http(false),
-                        new SecurityProperties.Audit(12)
+                        new SecurityProperties.Audit(12),
+                        new SecurityProperties.Invite("http://localhost:5173/invite", 72),
+                        new SecurityProperties.Bootstrap("")
                 ),
                 new RateLimiter(new RedisRateLimitStore(null), new InMemoryRateLimitStore())
         );
@@ -65,30 +66,12 @@ class AuthServiceTest {
 
     // ------------------------------------------------------------------ fakes
 
-    private static final class FakeUserMapper implements UserMapper {
-        private final List<UserAccount> users = new ArrayList<>();
-
-        @Override
-        public UserAccount findByEmail(String email) {
-            return users.stream()
-                    .filter(user -> user.getEmail().equals(email))
-                    .findFirst()
-                    .orElse(null);
-        }
-
-        @Override
-        public UserAccount findById(String id) {
-            return users.stream()
-                    .filter(user -> user.getId().equals(id))
-                    .findFirst()
-                    .orElse(null);
-        }
-
-        @Override
-        public int insert(UserAccount user) {
-            users.add(user);
-            return 1;
-        }
+    /**
+     * The shared in-memory mapper: it reproduces the real SQL constraints (unique email,
+     * exact-token administrator counting) so these tests can assert on behaviour rather
+     * than on call recording.
+     */
+    private static final class FakeUserMapper extends InMemoryUserMapper {
     }
 
     // ------------------------------------------------------------------ registration

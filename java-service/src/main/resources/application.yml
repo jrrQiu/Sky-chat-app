@@ -38,6 +38,14 @@ skychat:
   auth:
     # Self-registration is off by default; operators opt in explicitly.
     self-registration-enabled: ${AUTH_SELF_REGISTRATION_ENABLED:false}
+  invite:
+    # Where an invite link points: the front-end route rendering the set-password page.
+    base-url: ${INVITE_BASE_URL:http://localhost:5173/invite}
+    ttl-hours: ${INVITE_TTL_HOURS:72}
+  bootstrap:
+    # Set this to seed the first administrator. On startup, if no active administrator
+    # exists, an admin invitation is issued for this address and the link is logged once.
+    admin-email: ${BOOTSTRAP_ADMIN_EMAIL:}
   http:
     # Only enable behind a reverse proxy that always rewrites X-Forwarded-For.
     # The env var name is shared with the Python agent service on purpose: one
@@ -61,6 +69,12 @@ skychat:
     approval-decision:
       per-user:
         limit: ${RATE_LIMIT_APPROVAL_DECISION_PER_USER:30}
+    invitation-accept:
+      per-ip:
+        limit: ${RATE_LIMIT_INVITATION_ACCEPT_PER_IP:10}
+    admin:
+      per-user:
+        limit: ${RATE_LIMIT_ADMIN_PER_USER:120}
   approval:
     # Delay between resume reconciler ticks, and its initial delay after startup.
     resume-retry-ms: ${APPROVAL_RESUME_RETRY_MS:15000}

@@ -5,11 +5,16 @@ import java.util.Arrays;
 import java.util.List;
 
 public class UserAccount {
+    public static final String STATUS_ACTIVE = "active";
+    public static final String STATUS_DISABLED = "disabled";
+
     private String id;
     private String email;
     private String name;
     private String passwordHash;
     private String roles;
+    private String status = STATUS_ACTIVE;
+    private LocalDateTime disabledAt;
     private LocalDateTime createdAt;
 
     public String getId() {
@@ -68,5 +73,36 @@ public class UserAccount {
 
     public void setCreatedAt(LocalDateTime createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public String getStatus() {
+        return status == null ? STATUS_ACTIVE : status;
+    }
+
+    public void setStatus(String status) {
+        this.status = status;
+    }
+
+    public LocalDateTime getDisabledAt() {
+        return disabledAt;
+    }
+
+    public void setDisabledAt(LocalDateTime disabledAt) {
+        this.disabledAt = disabledAt;
+    }
+
+    public boolean isDisabled() {
+        return STATUS_DISABLED.equalsIgnoreCase(getStatus());
+    }
+
+    /**
+     * Role list with the stored string form as the source of truth. Kept next to
+     * {@link #getRolesList()} so a role change can rebuild the column value without
+     * a second parsing path.
+     */
+    public void setRolesList(List<String> values) {
+        this.roles = values == null || values.isEmpty()
+                ? UserRoles.DEFAULT
+                : String.join(",", values);
     }
 }

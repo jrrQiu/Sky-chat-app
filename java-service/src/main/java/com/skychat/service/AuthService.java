@@ -2,6 +2,7 @@ package com.skychat.service;
 
 import com.skychat.config.SecurityProperties;
 import com.skychat.domain.UserAccount;
+import com.skychat.domain.UserRoles;
 import com.skychat.mapper.UserMapper;
 import com.skychat.service.ratelimit.RateLimiter;
 import org.springframework.stereotype.Service;
@@ -15,8 +16,8 @@ import java.security.SecureRandom;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Base64;
+import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -72,6 +73,7 @@ public class AuthService {
 
     public static final String SELF_REGISTRATION_DISABLED = "SELF_REGISTRATION_DISABLED";
     public static final String ACCOUNT_LOCKED = "ACCOUNT_LOCKED";
+    public static final String ACCOUNT_DISABLED = "ACCOUNT_DISABLED";
     public static final String INVALID_CREDENTIALS = "INVALID_CREDENTIALS";
     public static final String EMAIL_ALREADY_REGISTERED = "EMAIL_ALREADY_REGISTERED";
     /** Deliberately identical for an unknown email and a wrong password. */
@@ -145,11 +147,36 @@ public class AuthService {
     }
 
     private AuthSession registerNow(String email, String password, String name) {
+        UserAccount user = createAccount(email, name, List.of(UserRoles.DEFAULT), password);
+        return new AuthSession(
+                jwtService.createToken(user.getId(), user.getEmail(), user.getRolesList()),
+                user
+        );
+    }
+
+    /**
+     * Creates an account with explicit roles.
+     *
+     * <p>Shared by the (usually disabled) self-registration path, the admin console and the
+     * invitation accept flow, so password hashing, the password policy and the duplicate-email
+     * check can never drift between them. Roles are validated against
+     * {@link UserRoles#normalize}.</p>
+     *
+     * @throws AuthException with {@code PASSWORD_*} or {@code EMAIL_ALREADY_REGISTERED}
+     * @throws IllegalArgumentException when a requested role is not known
+     */
+    public UserAccount createAccount(
+            String email,
+            String name,
+            List<String> roles,
+            String password
+    ) {
         String normalizedEmail = normalizeEmail(email);
         PasswordPolicy.Result policy = passwordPolicy.validate(password);
         if (!policy.accepted()) {
             throw new AuthException(policy.code(), policy.message());
         }
+        List<String> normalizedRoles = UserRoles.normalize(roles);
         if (userMapper.findByEmail(normalizedEmail) != null) {
             throw new AuthException(EMAIL_ALREADY_REGISTERED, "该邮箱已经注册");
         }
@@ -157,15 +184,26 @@ public class AuthService {
         UserAccount user = new UserAccount();
         user.setId(UUID.randomUUID().toString());
         user.setEmail(normalizedEmail);
-        user.setName(name == null || name.isBlank() ? normalizedEmail.split("@")[0] : name.trim());
+        user.setName(displayName(name, normalizedEmail));
         user.setPasswordHash(hashPassword(password));
-        user.setRoles("employee");
+        user.setRolesList(normalizedRoles);
+        user.setStatus(UserAccount.STATUS_ACTIVE);
         user.setCreatedAt(LocalDateTime.now());
         userMapper.insert(user);
-        return new AuthSession(
-                jwtService.createToken(user.getId(), user.getEmail(), user.getRolesList()),
-                user
-        );
+        return user;
+    }
+
+    /** Name fallback shared by every account-creation path. */
+    public static String displayName(String name, String email) {
+        if (name != null && !name.isBlank()) {
+            return name.trim();
+        }
+        return email.split("@")[0];
+    }
+
+    /** Exposed so invitation and admin flows normalise addresses identically. */
+    public String normalizeEmailOrThrow(String email) {
+        return normalizeEmail(email);
     }
 
     /**
@@ -195,12 +233,24 @@ public class AuthService {
     }
 
     /**
-     * A successful credential check. A failure is represented by the absence of this value,
-     * never by a null {@code Mono} item: Reactor forbids null items and {@code Mono.fromCallable}
-     * turns a null return into an empty completion, which would silently skip the failure
-     * branch below.
+     * A successful credential check, or the reason it failed.
+     *
+     * <p>A failure is represented by the absence of a session, never by a null {@code Mono}
+     * item: Reactor forbids null items and {@code Mono.fromCallable} turns a null return into
+     * an empty completion, which would silently skip the failure branch below.</p>
      */
-    private record Authenticated(AuthSession session) {
+    private record Authenticated(AuthSession session, String failureCode) {
+        static Authenticated ok(AuthSession session) {
+            return new Authenticated(session, null);
+        }
+
+        static Authenticated badCredentials() {
+            return new Authenticated(null, INVALID_CREDENTIALS);
+        }
+
+        static Authenticated disabled() {
+            return new Authenticated(null, ACCOUNT_DISABLED);
+        }
     }
 
     private Mono<LoginOutcome> attempt(String normalizedEmail, String password) {
@@ -211,24 +261,45 @@ public class AuthService {
                             : verifyPassword(password, user.getPasswordHash());
 
                     if (user == null || !passwordMatches) {
-                        return Optional.<Authenticated>empty();
+                        return Authenticated.badCredentials();
                     }
-                    return Optional.of(new Authenticated(new AuthSession(
+                    // Only reveal the account state to someone who proved the password,
+                    // otherwise a disabled account would be an enumeration oracle.
+                    if (user.isDisabled()) {
+                        return Authenticated.disabled();
+                    }
+                    return Authenticated.ok(new AuthSession(
                             jwtService.createToken(user.getId(), user.getEmail(), user.getRolesList()),
                             user
-                    )));
+                    ));
                 })
                 .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(identity -> Mono.justOrEmpty(identity))
-                .map(Authenticated::session)
-                .flatMap(session -> {
-                    // A success clears the window so an honest typo spree does not lock the user
-                    // out later.
-                    return rateLimiter.reset(LOGIN_FAILURE_BUCKET, normalizedEmail)
-                            .onErrorResume(error -> Mono.empty())
-                            .thenReturn(LoginOutcome.success(session));
-                })
-                .switchIfEmpty(Mono.defer(() -> recordFailure(normalizedEmail)));
+                .flatMap(result -> result.session() == null
+                        ? denial(result.failureCode(), normalizedEmail)
+                        : succeeded(result.session(), normalizedEmail));
+    }
+
+    /**
+     * Correct credentials: clear the failure window so an honest typo spree does not lock
+     * the user out later.
+     */
+    private Mono<LoginOutcome> succeeded(AuthSession session, String normalizedEmail) {
+        return rateLimiter.reset(LOGIN_FAILURE_BUCKET, normalizedEmail)
+                .onErrorResume(error -> Mono.empty())
+                .thenReturn(LoginOutcome.success(session));
+    }
+
+    /**
+     * A rejected attempt. A disabled account is not a credential failure, so it must not
+     * advance the lockout counter — otherwise repeatedly poking a disabled account would
+     * lock an account that is already unusable, and the counter would show up in the audit
+     * log as failed logins.
+     */
+    private Mono<LoginOutcome> denial(String failureCode, String normalizedEmail) {
+        if (ACCOUNT_DISABLED.equals(failureCode)) {
+            return Mono.just(LoginOutcome.failure(ACCOUNT_DISABLED, "账号已停用，请联系管理员"));
+        }
+        return recordFailure(normalizedEmail);
     }
 
     public UserAccount findById(String userId) {

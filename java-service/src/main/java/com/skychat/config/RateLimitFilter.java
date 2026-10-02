@@ -36,6 +36,8 @@ import java.util.Optional;
  *   <li>{@code POST /v1/auth/register}: 5 per hour per IP</li>
  *   <li>{@code POST /v1/chat/stream} and {@code /v1/agent/chat/stream}: 60 per min per user</li>
  *   <li>{@code PATCH /v1/approvals/{id}/decision}: 30 per min per user</li>
+ *   <li>{@code POST /v1/auth/invitations/accept}: 10 per min per IP (unauthenticated)</li>
+ *   <li>{@code /v1/admin/**}: 120 per min per user</li>
  * </ul>
  */
 @Component
@@ -113,6 +115,28 @@ public class RateLimitFilter implements WebFilter {
                     "approval-decision-user",
                     subject(exchange, clientIp),
                     properties.approvalDecision().perUser().limit(),
+                    MINUTE,
+                    exchange
+            ).then(proceedOrLimit(exchange, chain));
+        }
+
+        // Unauthenticated and token-guessing, so the window is keyed on the source address.
+        // A valid token is 256 bits, so this is defence in depth rather than the only barrier.
+        if (method == HttpMethod.POST && "/v1/auth/invitations/accept".equals(path)) {
+            return check(
+                    "invitation-accept-ip",
+                    Optional.ofNullable(clientIp),
+                    properties.invitationAccept().perIp().limit(),
+                    MINUTE,
+                    exchange
+            ).then(proceedOrLimit(exchange, chain));
+        }
+
+        if (path.startsWith("/v1/admin/")) {
+            return check(
+                    "admin-user",
+                    subject(exchange, clientIp),
+                    properties.admin().perUser().limit(),
                     MINUTE,
                     exchange
             ).then(proceedOrLimit(exchange, chain));

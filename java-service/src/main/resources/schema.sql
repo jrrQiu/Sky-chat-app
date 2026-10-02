@@ -6,14 +6,45 @@ CREATE TABLE IF NOT EXISTS user_account (
     name VARCHAR(120) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     roles VARCHAR(255) NOT NULL DEFAULT 'employee',
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
+    disabled_at TIMESTAMP NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- `CREATE TABLE IF NOT EXISTS` never evolves an existing table, so every column
--- added to a CREATE statement above must also get a guard here. Without this one,
--- a database created before `roles` existed makes every login fail with
+-- added above must also get a guard here. Without the `roles` one, a database
+-- created before that column existed makes every login fail with
 -- "column roles does not exist".
 ALTER TABLE user_account ADD COLUMN IF NOT EXISTS roles VARCHAR(255) NOT NULL DEFAULT 'employee';
+ALTER TABLE user_account ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'active';
+ALTER TABLE user_account ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMP NULL;
+
+CREATE INDEX IF NOT EXISTS idx_user_account_status ON user_account(status);
+
+-- Invitations replace open self-registration: an administrator names the email and
+-- the roles, and the invitee sets their own password through a one-time link.
+-- Only the SHA-256 of the token is stored, so a database read cannot be replayed.
+CREATE TABLE IF NOT EXISTS user_invitation (
+    id VARCHAR(64) PRIMARY KEY,
+    email VARCHAR(320) NOT NULL,
+    name VARCHAR(120) NULL,
+    roles VARCHAR(255) NOT NULL DEFAULT 'employee',
+    token_hash VARCHAR(128) NOT NULL UNIQUE,
+    invited_by VARCHAR(64) NULL,
+    expires_at TIMESTAMP NOT NULL,
+    accepted_at TIMESTAMP NULL,
+    accepted_by VARCHAR(64) NULL,
+    revoked_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE user_invitation ADD COLUMN IF NOT EXISTS name VARCHAR(120) NULL;
+ALTER TABLE user_invitation ADD COLUMN IF NOT EXISTS invited_by VARCHAR(64) NULL;
+ALTER TABLE user_invitation ADD COLUMN IF NOT EXISTS accepted_by VARCHAR(64) NULL;
+ALTER TABLE user_invitation ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP NULL;
+
+CREATE INDEX IF NOT EXISTS idx_user_invitation_email ON user_invitation(email);
+CREATE INDEX IF NOT EXISTS idx_user_invitation_expiry ON user_invitation(expires_at);
 
 CREATE TABLE IF NOT EXISTS conversation (
     id VARCHAR(64) PRIMARY KEY,
