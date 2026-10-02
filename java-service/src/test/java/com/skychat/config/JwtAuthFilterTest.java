@@ -188,6 +188,43 @@ class JwtAuthFilterTest {
                 .isEqualTo("employee");
     }
 
+    /**
+     * Regression test for a bug that only a live run exposed: the "account not found" fallback
+     * was attached after {@code chain.filter(...)}, whose {@code Mono<Void>} completes
+     * <em>empty</em> on every normal request. The filter therefore tried to write a 401 after
+     * every response — harmless for JSON, but for a server-sent-event response the headers are
+     * already committed by then, so setting the status threw and the connection was torn down.
+     */
+    @Test
+    @DisplayName("a normally completed request is not rewritten as 401 by the filter")
+    void completedChainIsNotRewrittenAsUnauthorized() {
+        account("dave", UserAccount.STATUS_ACTIVE);
+
+        // RecordingChain returns Mono.empty(), exactly like every real WebFilterChain.
+        MockServerWebExchange exchange = request("/v1/conversations", tokenFor("dave"));
+        RecordingChain chain = new RecordingChain();
+        filter.filter(exchange, chain).block();
+
+        assertThat(chain.continued).isTrue();
+        assertThat(exchange.getResponse().getStatusCode())
+                .isNotEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    @DisplayName("a rejection after the response is committed ends the exchange instead of throwing")
+    void rejectionOnACommittedResponseDoesNotThrow() {
+        // No account for this token, so the filter takes the rejection path.
+        MockServerWebExchange exchange = request("/v1/conversations", tokenFor("vanished"));
+        // Simulate a streaming response that has already flushed its headers.
+        exchange.getResponse().setComplete().block();
+        assertThat(exchange.getResponse().isCommitted()).isTrue();
+
+        RecordingChain chain = new RecordingChain();
+        filter.filter(exchange, chain).block();
+
+        assertThat(chain.continued).isFalse();
+    }
+
     @Test
     @DisplayName("a token for an account that no longer exists is rejected")
     void unknownAccountIsRejected() {

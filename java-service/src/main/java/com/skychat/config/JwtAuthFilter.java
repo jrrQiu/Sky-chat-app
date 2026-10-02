@@ -1,5 +1,6 @@
 package com.skychat.config;
 
+import com.skychat.domain.UserAccount;
 import com.skychat.mapper.UserMapper;
 import com.skychat.service.JwtService;
 import org.springframework.core.Ordered;
@@ -17,6 +18,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Optional;
 
 /**
  * Authenticates the end-user bearer token and surfaces the identity as {@code X-User-ID} and
@@ -71,9 +73,17 @@ public class JwtAuthFilter implements WebFilter {
         }
 
         String userId = claims.userId();
-        return Mono.fromCallable(() -> userMapper.findById(userId))
+        // The lookup is wrapped in an Optional so "no such account" is a real value rather than
+        // an empty completion. Reactor turns a null item into an empty Mono, and a
+        // switchIfEmpty placed after the chain would then also fire on the chain's own empty
+        // completion — i.e. after every response, when the headers are already committed.
+        return Mono.fromCallable(() -> Optional.ofNullable(userMapper.findById(userId)))
                 .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(user -> {
+                .flatMap(found -> {
+                    if (found.isEmpty()) {
+                        return unauthorized(exchange);
+                    }
+                    UserAccount user = found.get();
                     if (user.isDisabled()) {
                         return unauthorized(exchange, "ACCOUNT_DISABLED");
                     }
@@ -86,12 +96,7 @@ public class JwtAuthFilter implements WebFilter {
                             .header("X-User-Roles", String.join(",", user.getRolesList()))
                             .build();
                     return chain.filter(exchange.mutate().request(mutatedRequest).build());
-                })
-                // A deleted account yields a null from the mapper, and Mono.fromCallable turns
-                // a null return into an EMPTY completion — so without this line the filter
-                // would neither continue the chain nor write a response, and the caller would
-                // get a status-less empty reply instead of a 401.
-                .switchIfEmpty(Mono.defer(() -> unauthorized(exchange)));
+                });
     }
 
     private Mono<Void> unauthorized(ServerWebExchange exchange) {
@@ -99,6 +104,13 @@ public class JwtAuthFilter implements WebFilter {
     }
 
     private Mono<Void> unauthorized(ServerWebExchange exchange, String code) {
+        // A streaming response commits its headers as soon as the first event is written, and a
+        // committed response hands out a read-only header view — setting the status would throw
+        // and tear the connection down. At that point the status cannot be changed any more, so
+        // the only honest action left is to end the exchange.
+        if (exchange.getResponse().isCommitted()) {
+            return exchange.getResponse().setComplete();
+        }
         exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
         exchange.getResponse().getHeaders().set(
                 HttpHeaders.CONTENT_TYPE,

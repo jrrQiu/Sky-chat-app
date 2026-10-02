@@ -79,3 +79,21 @@ skychat:
     # Delay between resume reconciler ticks, and its initial delay after startup.
     resume-retry-ms: ${APPROVAL_RESUME_RETRY_MS:15000}
     resume-retry-initial-ms: ${APPROVAL_RESUME_RETRY_INITIAL_MS:20000}
+  agent-call:
+    # TCP handshake budget. When this trips the request was never delivered, which is what
+    # makes the retry below safe.
+    connect-timeout-ms: ${AGENT_CONNECT_TIMEOUT_MS:3000}
+    # Idle-read guard on an established connection, NOT a total deadline: the chat endpoint
+    # streams, and a long generation legitimately goes quiet between tokens.
+    idle-timeout-ms: ${AGENT_IDLE_TIMEOUT_MS:120000}
+    # Only connection-level failures are retried, so this never re-runs a started model turn.
+    retry-attempts: ${AGENT_RETRY_ATTEMPTS:2}
+    retry-backoff-ms: ${AGENT_RETRY_BACKOFF_MS:300}
+    breaker-failure-threshold: ${AGENT_BREAKER_FAILURE_THRESHOLD:5}
+    breaker-open-ms: ${AGENT_BREAKER_OPEN_MS:30000}
+  run-events:
+    # Bounded buffer for SSE resume. Per JVM: multi-replica replay needs a shared store.
+    max-runs: ${RUN_EVENTS_MAX_RUNS:500}
+    ttl-seconds: ${RUN_EVENTS_TTL_SECONDS:1800}
+    max-events-per-run: ${RUN_EVENTS_MAX_PER_RUN:2000}
+    cleanup-interval-ms: ${RUN_EVENTS_CLEANUP_MS:60000}
