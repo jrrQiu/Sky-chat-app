@@ -3,6 +3,7 @@ package com.skychat.controller;
 import com.skychat.service.AuthException;
 import com.skychat.service.AuthService;
 import com.skychat.service.InvitationService;
+import com.skychat.service.TicketService;
 import com.skychat.service.UserAdminService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -27,15 +28,25 @@ final class ApiErrors {
 
     static HttpStatus statusFor(String code) {
         return switch (code) {
-            case "FORBIDDEN_NOT_ADMIN", "FORBIDDEN_ROLE_ESCALATION" -> HttpStatus.FORBIDDEN;
-            // "Cannot be used any more" is a conflict with current state, not a bad request.
+            case "FORBIDDEN_NOT_ADMIN", "FORBIDDEN_ROLE_ESCALATION",
+                 TicketService.FORBIDDEN_TICKET_ACTION,
+                 TicketService.INTERNAL_NOTE_FORBIDDEN -> HttpStatus.FORBIDDEN;
+            // "Cannot be used any more" / "not legal from the current state" is a conflict with
+            // the resource's current state, not a malformed request.
             case InvitationService.INVITATION_EXPIRED,
                  InvitationService.INVITATION_ALREADY_ACCEPTED,
                  InvitationService.INVITATION_REVOKED,
                  UserAdminService.LAST_ADMIN,
-                 UserAdminService.CANNOT_DISABLE_SELF -> HttpStatus.CONFLICT;
+                 UserAdminService.CANNOT_DISABLE_SELF,
+                 TicketService.INVALID_TRANSITION,
+                 TicketService.TICKET_ALREADY_MERGED,
+                 TicketService.MERGE_SELF,
+                 TicketService.MERGE_CYCLE,
+                 TicketService.LINK_SELF,
+                 TicketService.LINK_DUPLICATE -> HttpStatus.CONFLICT;
             case UserAdminService.NOT_FOUND,
-                 InvitationService.NOT_FOUND -> HttpStatus.NOT_FOUND;
+                 InvitationService.NOT_FOUND,
+                 TicketService.TICKET_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case AuthService.ACCOUNT_DISABLED -> HttpStatus.UNAUTHORIZED;
             case AuthService.SELF_REGISTRATION_DISABLED -> HttpStatus.FORBIDDEN;
             default -> HttpStatus.BAD_REQUEST;

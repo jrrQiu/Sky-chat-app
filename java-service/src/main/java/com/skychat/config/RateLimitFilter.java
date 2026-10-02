@@ -132,6 +132,16 @@ public class RateLimitFilter implements WebFilter {
             ).then(proceedOrLimit(exchange, chain));
         }
 
+        if (path.startsWith("/v1/tickets")) {
+            return check(
+                    "ticket-user",
+                    subject(exchange, clientIp),
+                    properties.ticket().perUser().limit(),
+                    MINUTE,
+                    exchange
+            ).then(proceedOrLimit(exchange, chain));
+        }
+
         if (path.startsWith("/v1/admin/")) {
             return check(
                     "admin-user",

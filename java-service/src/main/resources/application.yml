@@ -75,6 +75,9 @@ skychat:
     admin:
       per-user:
         limit: ${RATE_LIMIT_ADMIN_PER_USER:120}
+    ticket:
+      per-user:
+        limit: ${RATE_LIMIT_TICKET_PER_USER:300}
   approval:
     # Delay between resume reconciler ticks, and its initial delay after startup.
     resume-retry-ms: ${APPROVAL_RESUME_RETRY_MS:15000}

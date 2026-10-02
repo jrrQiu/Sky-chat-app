@@ -17,7 +17,8 @@ public record RateLimitProperties(
         @DefaultValue("60") Chat chat,
         @DefaultValue("30") ApprovalDecision approvalDecision,
         @DefaultValue InvitationAccept invitationAccept,
-        @DefaultValue Admin admin
+        @DefaultValue Admin admin,
+        @DefaultValue Ticket ticket
 ) {
     /**
      * {@code login}: 10 per 5 min per IP and 5 per 5 min per email.
@@ -58,6 +59,14 @@ public record RateLimitProperties(
      * finer-grained protection is the role gate, not the counter.
      */
     public record Admin(@DefaultValue("120") Limit perUser) {
+    }
+
+    /**
+     * {@code ticket}: 300 per minute per user. Generous, because a working ticket queue is
+     * chatty (open, comment, transition); the purpose is to bound a runaway client, not to
+     * pace a human.
+     */
+    public record Ticket(@DefaultValue("300") Limit perUser) {
     }
 
     /**
