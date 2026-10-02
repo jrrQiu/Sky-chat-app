@@ -26,7 +26,7 @@ OTel GenAI 约定、RAG 评测）。
 
 ### Top 12 必改项（按优先级）
 
-> **本轮状态**：#1 #2 #3 #3b #4 #6 已修复并端到端验证（见 §12）；**#5（审批 UI）未做**，需要单独的前端工程。其余为 P1，未动。
+> **本轮状态**：#1–#6 已修复并端到端验证（见 §12、§13、§14）；**#7–#12 六项 P1 已修复**（见 §15），其中 #7 在 P0 轮已修一半（缓存机制），本轮补上生产触发点，#8–#12 本轮新做。仍未做：§9.2 的完整审批引擎（会签/超时结论/委派/邮件链接）、§13-B/C 的注册入口加固。
 
 | # | 优先级 | 问题 | 证据 | 改法方向 |
 |---|---|---|---|---|
@@ -37,12 +37,12 @@ OTel GenAI 约定、RAG 评测）。
 | 4 | **P0** | 无任何审计日志表/接口，用户与管理动作不可追溯 | 全仓 grep `audit` = 0 命中 | 追加式审计表 + 关键动作埋点 + 导出 |
 | 5 | **P0** | 前端**没有审批界面**：整个 checkpoint 审批链路只能靠 API 调 | `front-service` 全量 grep `approval` = 0 命中 | 审批中心页面 + 待办角标 + 审批详情 |
 | 6 | **P0** | 检索到的文档/网页不做间接提示注入检测；Guardian 仅正则，且只查用户消息 | `guardian.py:6-12,39` | 检索内容进入上下文前过检测；输出侧接地校验 |
-| 7 | **P1** | 知识索引 `lru_cache(maxsize=1)` 进程内缓存，**知识更新必须重启**；`load_index()` 全量载入内存 | `ingest.py:31-32`、`knowledge_repository.py:222` | 外部索引/向量库；热更新与版本化；分页/租户过滤下推 SQL |
-| 8 | **P1** | 默认向量通道是 **Hash 伪向量**（无 embedding key 时），"混合检索"实际只有词法 | `embedding.py:72-75` | 接真实 embedding 并持久化向量；或明确降级为 BM25 并如实标注 |
-| 9 | **P1** | 可观测性是空实现：`tracing.py` 两个函数直接 `return`，无 trace/无 token/成本统计 | `observability/tracing.py:4-21` | 接 OTel + Langfuse，落 token/成本/时延；补指标端点 |
-| 10 | **P1** | 评测无门槛：`run_eval.py` 只打印 JSON，无阈值无退出码；`citation_accuracy`/`groundedness` 是"非空"伪指标 | `eval/run_eval.py:10`、`eval/metrics.py` | LLM-as-judge + 忠实度；阈值化并进 CI |
-| 11 | **P1** | `RunEventStore` 进程内 `ConcurrentHashMap` 且**无淘汰**：多副本 SSE 回放/取消失效，且事件永久驻留堆内存 | `RunEventStore.java:19,54` | 迁 Redis Streams（已有 `RedisEventStream` 可复用）；加 TTL 与上限 |
-| 12 | **P1** | Java→Python 主链路 `AgentGatewayClient` **无超时/重试/熔断**；Java 无全局异常处理 | `AgentGatewayClient.java:39-43`、无 `@RestControllerAdvice` | 加超时+重试+熔断+降级；统一错误响应 |
+| 7 | **P1** | 知识索引 `lru_cache(maxsize=1)` 进程内缓存，**知识更新必须重启**；`load_index()` 全量载入内存 | ~~`ingest.py:31-32`~~ | ✅ 已修（§15.1）：TTL + 写入即失效 + 运维刷新端点；但**多副本失效仍需 Redis**，且真正的外部索引/向量库仍未做 |
+| 8 | **P1** | 默认向量通道是 **Hash 伪向量**（无 embedding key 时），"混合检索"实际只有词法 | ~~`embedding.py:72-75`~~ | ✅ 已修（§15.2）：无真实 provider 就**如实降级为词法**并在 `/ready` 标注；哈希向量改为显式 opt-in |
+| 9 | **P1** | 可观测性是空实现：`tracing.py` 两个函数直接 `return`，无 trace/无 token/成本统计 | ~~`observability/tracing.py:4-21`~~ | ✅ 已修（§15.3）：真实指标注册表 + Prometheus 端点 + token/成本记账；**未接 OTel SDK 与 Langfuse，已如实标注** |
+| 10 | **P1** | 评测无门槛：`run_eval.py` 只打印 JSON，无阈值无退出码；`citation_accuracy`/`groundedness` 是"非空"伪指标 | ~~`eval/run_eval.py:10`~~ | ✅ 已修（§15.4）：阈值化 + 退出码 0/1/2；引用改为真实解析；groundedness 无裁判时报**不可用**而非 1.0 |
+| 11 | **P1** | `RunEventStore` 进程内 `ConcurrentHashMap` 且**无淘汰**：多副本 SSE 回放/取消失效，且事件永久驻留堆内存 | ~~`RunEventStore.java:19,54`~~ | ⚠️ 部分修复（§15.5）：TTL + 运行数上限 + 每运行事件上限已加（内存有界）；**多副本仍需共享存储**——注意原文提到的 `RedisEventStream` 在本仓库**并不存在**，是错误引用 |
+| 12 | **P1** | Java→Python 主链路 `AgentGatewayClient` **无超时/重试/熔断**；Java 无全局异常处理 | ~~`AgentGatewayClient.java:39-43`~~ | ✅ 已修（§15.6）：连接/空闲超时、仅对"连接未建立"重试、熔断器、统一 `@RestControllerAdvice` |
 
 ---
 
@@ -571,13 +571,78 @@ AI 部分（编排、检索、审批恢复）已经是相对领先的一块，�
 **做这件事时又发现并修掉四个缺陷**（前两个由单元测试、后两个由实时端到端验证发现）：
 
 1. `countAdministrators` 原本用 `roles LIKE '%admin%'`，会把 `network_admin` 也算成管理员 → 改为 CSV 精确 token 匹配。
-2. `JwtAuthFilter` 里 `Mono.fromCallable` 对已删除账号返回 `null` 会变成**空 Mono**，导致既不继续链路也不写响应（返回一个没有状态的空响应）→ 加 `switchIfEmpty`。
+2. `JwtAuthFilter` 里 `Mono.fromCallable` 对已删除账号返回 `null` 会变成**空 Mono**，导致既不继续链路也不写响应（返回一个没有状态的空响应）。当时加的是 `switchIfEmpty`，但那个位置**本身就是错的**——它在 `chain.filter(...)` 之后，而 `Mono<Void>` 正常完成也是 empty，于是每次响应结束后都会去写 401；流式响应此时已提交，直接抛异常并撕掉连接。最终改为把查询包进 `Optional`，让"账号不存在"成为一个真实值而不是空完成（详见 §15.7）。
 3. **"最后一个管理员"保护过弱**：`user_admin` 也被计入管理员数，所以只要存在一个 `user_admin`，最后一个**真正的 admin** 就能被降权——结果没人能再授予管理员角色，正是这个守卫要防的死锁。→ 区分"能管理员"与"能授予管理员角色"，降权/停用 `admin` 时按 `countFullAdministrators` 判断。
 4. **角色变更不即时生效**（比第 3 点更严重）：JWT 里的角色是签发时写死的，所以被降权的管理员**仍然保有一个长达 7 天的管理员 token**；停用是即时生效的，降权却不是。→ 让过滤器用**数据库里的当前角色**而不是 token 里的角色（同一次查询，零额外成本），停用与降权都在下一个请求生效。
 
 第 3、4 点单测发现不了——它们需要"两个管理员 + 一个 user_admin + 两次登录"这种真实状态组合，是我跑端到端脚本时暴露出来的。
 
 **仍未做**：邮箱验证与验证码/反自动化（§13 的 B）、注册限流的 fail-closed 分层（§13 的 C）、成员管理之外的密码重置流程。
+
+---
+
+## 15. P1 修复记录（#7–#12，本轮已落地并验证）
+
+统一原则：**宁可如实报告能力缺失，也不要让占位实现冒充能力**。六项里有四项的根因都是"看起来有、实际没有"。
+
+### 15.1 #7 知识索引：从"重启才生效"到"写入即失效"
+
+P0 轮已把 `lru_cache` 换成 TTL 缓存 + `invalidate_index()`，但**只有测试在调用它**，生产路径没有任何触发点。本轮补上：写入路径调用即失效（带 generation 守卫，避免与并发写竞争的旧索引被回填缓存）；新增内部鉴权的 `POST /v1/knowledge/index/refresh` 供运维强制重建；`/ready` 的 `index_cache` 扩展为 age / ttl / generation / 文档与分片计数 / 作用域角色。
+
+**残留（需诚实标注）**：跨副本失效仍需 Redis pub/sub——刷新端点只让**处理该请求的那个进程**失效，其他副本要等 TTL。真正的稠密检索也需要向量库（pgvector/Qdrant）并把分片向量在摄取时落库；当前即使配置了 HTTP embedding，每次查询仍会重新 embed 全部候选，只适用于玩具语料。
+
+### 15.2 #8 稠密通道：不再静默伪造
+
+原来无 embedding key 时 `default_embedding_provider()` 会**静默**返回哈希伪向量，于是"混合检索"里混进了一路纯噪声。现在：解析器返回 `None`，检索**如实降级为词法**，并在结果、plan、`to_dict()` 与 `/ready` 四处标注 `lexical_only`；哈希向量移入 `ALLOW_HASH_EMBEDDINGS` 显式开关（默认关）且构造时大声告警；`hybrid_search` 把原来误标为 `vector` 的稀疏通道改标 `sparse`，稠密通道改为**增量**而非替换稀疏结果。
+
+**同类缺陷一并修掉**（子代理因文件归属未动，本轮接手）：`app/intent/semantic.py` 此前默认构造哈希向量却把结果标为 `"semantic"`——现在无真实 provider 即不可用（回退到规则/LLM 路径），使用哈希时标注 `token-overlap`，状态接入 `/ready`；`app/tickets/similar_search.py` 把稀疏余弦改标 `sparse` 而非 `vector`。
+
+### 15.3 #9 可观测性：从空实现到真实记账
+
+原 `tracing.py` 两个函数体只有 `return`。现在：线程安全的进程内指标注册表（计数器/直方图）作为唯一事实来源；`GET /metrics` 以 Prometheus 文本暴露，**受内部身份保护**（它暴露模型、流量与花费）；从 provider 返回的 usage 记 token / 时延 / 成本，未上报的 usage 记为 `unreported` 而**不记为零**；OTLP/HTTP 尽力导出（2 秒超时、绝不抛进请求路径、导出前剥离提示词与用户 id）。
+
+**如实标注的部分**：未接 OpenTelemetry SDK 与 Langfuse SDK（不新增依赖），因此 `/ready` 明写 `instrumentation: manual-best-effort`、`auto_instrumentation: false`、Langfuse `not-configured`。价格表只收**已核实**的型号（`deepseek-flash`、`deepseek-v4-pro`，取低谷价）；仓库默认的 `deepseek-chat` 无公开价，因此**成本报不可用而非估算**。
+
+### 15.4 #10 评测：从打印 JSON 到可进 CI 的门槛
+
+`run_eval.py` 现在支持阈值文件 / `--set` / `--require` / `--judge` / `--json`，逐指标 PASS/FAIL/UNAVAILABLE，退出码 0（通过）/ 1（越界或必需指标不可用）/ 2（调用错误）。`citation_accuracy` 改为**真实解析**：引用必须命中实际检索到的文档集合，`[n]` 标注越界计 0 分。`groundedness` 需要 LLM 裁判，无裁判时返回 `None` + 原因，**不再伪造 1.0**；有裁判时用 `temperature=0` 并记录 `PROMPT_VERSION`。
+
+### 15.5 #11 运行事件缓冲：内存有界（多副本仍待做）
+
+`RunEventStore` 原来把每个 run 的每个事件永久留在堆里。现在有 TTL（默认 30 分钟，仅淘汰已结束的 run）、运行数上限（默认 500，优先淘汰已结束的）、每运行事件上限（默认 2000）。事件被丢弃时不会静默跳过：`replay` 会先发一个 `event: truncated` 事件告知客户端游标之前的空洞。
+
+**仍未做**：多副本 SSE 回放与取消需要共享存储（Redis Streams）。原文称"已有 `RedisEventStream` 可复用"——**经查该文件在本仓库并不存在**，属文档错误引用，此处更正。
+
+### 15.6 #12 Java→Python 链路韧性 + 统一错误契约
+
+- **超时**：连接超时 3 秒；空闲读超时 120 秒。刻意区分两者——连不上的请求**可以安全重试**（请求从未送达），而"连上之后卡住"的 POST 若重试会**重复执行并重复计费**，因此不重试。
+- **熔断**：仅统计传输层失败（HTTP 4xx/5xx 是"服务活着但在拒绝我们"，计入会因调用方 bug 打开熔断）；打开后快速失败，冷却后半开探测。
+- **错误契约**：新增 `@RestControllerAdvice`，全部错误统一为 `{"error": CODE, "message": ...}`；未预期异常返回 500 且**不回显内部信息**（日志留全量）。
+- `/health` 现在暴露 `runEvents`（有界缓冲统计）与 `agentCircuit` 状态。
+
+### 15.7 本轮由"实时验证"抓出的缺陷（单测抓不到）
+
+| 缺陷 | 为什么单测抓不到 |
+|---|---|
+| **SSE 流结束后连接被撕掉**：`JwtAuthFilter` 的"账号不存在"兜底 `switchIfEmpty` 被放在 `chain.filter(...)` **之后**，而 `Mono<Void>` 正常完成就是 empty，于是每次响应结束后都去写 401；流式响应此时已提交，`ReadOnlyHttpHeaders.set` 抛异常、连接中断。JSON 路径侥幸没炸 | 单测里 `MockServerWebExchange` 的行为与真实 Netty 不同（其 `bufferFactory().wrap` 本身未实现）。只有真实服务 + 流式响应才暴露 |
+| **新增 `@ConfigurationProperties` 未注册**，Spring 上下文启动即失败 | 单测直接构造这些类，从不启动应用上下文 |
+| **`countAdministrators` 用 `LIKE '%admin%'`** 会把 `network_admin` 也算作管理员 | 需要 `network_admin` 账号的真实数据组合 |
+| **"最后一个管理员"保护过弱** + **角色变更不即时生效**（被降权者仍握有最长 7 天的管理员 token） | 需要"两个管理员 + 一个 user_admin + 两次登录"的真实状态组合 |
+
+这张表本身就是本轮最该记住的结论：**账号状态、权限、流式响应、Spring 上下文这四类问题，单元测试基本抓不到，必须跑真实服务。**
+
+### 15.8 验证结果
+
+| 层次 | 结果 |
+|---|---|
+| Java 单测 | **143 项全绿**（新增 23 项：有界缓冲淘汰与截断标记、熔断状态机与重试安全性分类、错误契约映射、过滤器回归） |
+| Python 单测 | **222 项全绿**（新增 117 项：检索诚实性、索引失效、指标注册表、成本记账、`/metrics`、评测门槛、意图标注、工单标签） |
+| 前端 | `tsc --noEmit` 0 错误 |
+| 实时：Java 韧性 | **16/16** · agent 停机时 SSE 返回结构化 error 事件（非 500）、连续失败后熔断打开、被拒请求 <1 秒返回、`/health` 可观测 |
+| 实时：Python 能力 | **15/15** · `/metrics` 需内部身份且无泄漏、索引刷新 generation 递增、**一次真实模型调用记录 `llm_calls` / `llm_tokens=1441` / `llm_cost_usd=$0.000529`**（真实测量而非桩） |
+| 实时：整体回归 | **26/26** · 邀请制开户 → 发起审批 → 待办队列 → 自我审批 403 → 通过且 `resume=resumed` → 轨迹与归属落库 → 审计；同一次运行里 P1 的有界缓冲与熔断状态正常 |
+| 数据库 | schema 漂移检查 PASS（16 张表与 DDL 声明一致） |
+
 
 
 
