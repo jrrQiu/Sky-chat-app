@@ -23,8 +23,45 @@ mybatis:
 
 agent-service:
   url: ${AGENT_SERVICE_URL:http://localhost:8000}
-  token: ${AGENT_SERVICE_TOKEN:replace-with-internal-jwt}
+  # HS256 key for the short-lived internal service JWT (Java mints, Python verifies).
+  # Intentionally has NO default: the service refuses to start without it, because a
+  # guessable default would make every internal call forgeable.
+  internal-jwt-secret: ${AGENT_INTERNAL_JWT_SECRET:}
+  # Legacy static bearer. No longer the primary credential; kept for compatibility only.
+  token: ${AGENT_SERVICE_TOKEN:}
 
 auth:
   jwt-secret: ${JWT_SECRET:skychat-local-jwt-secret-change-me}
   jwt-ttl-seconds: ${JWT_TTL_SECONDS:604800}
+
+skychat:
+  auth:
+    # Self-registration is off by default; operators opt in explicitly.
+    self-registration-enabled: ${AUTH_SELF_REGISTRATION_ENABLED:false}
+  http:
+    # Only enable behind a reverse proxy that always rewrites X-Forwarded-For.
+    # The env var name is shared with the Python agent service on purpose: one
+    # deployment-wide switch must not have two names.
+    trust-forwarded-for: ${TRUST_FORWARDED_FOR:false}
+  audit:
+    # Retention contract for the (not yet implemented) audit purge job.
+    retention-months: ${AUDIT_RETENTION_MONTHS:12}
+  rate-limit:
+    login:
+      per-ip:
+        limit: ${RATE_LIMIT_LOGIN_PER_IP:10}
+      per-email:
+        limit: ${RATE_LIMIT_LOGIN_PER_EMAIL:5}
+    register:
+      per-ip:
+        limit: ${RATE_LIMIT_REGISTER_PER_IP:5}
+    chat:
+      per-user:
+        limit: ${RATE_LIMIT_CHAT_PER_USER:60}
+    approval-decision:
+      per-user:
+        limit: ${RATE_LIMIT_APPROVAL_DECISION_PER_USER:30}
+  approval:
+    # Delay between resume reconciler ticks, and its initial delay after startup.
+    resume-retry-ms: ${APPROVAL_RESUME_RETRY_MS:15000}
+    resume-retry-initial-ms: ${APPROVAL_RESUME_RETRY_INITIAL_MS:20000}

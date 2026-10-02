@@ -1,6 +1,8 @@
 package com.skychat.controller;
 
+import com.skychat.config.ClientAddressResolver;
 import com.skychat.domain.Conversation;
+import com.skychat.service.AuditService;
 import com.skychat.service.ConversationService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -12,6 +14,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -22,9 +25,17 @@ import java.util.Map;
 @RequestMapping("/v1/conversations")
 public class ConversationController {
     private final ConversationService conversationService;
+    private final AuditService auditService;
+    private final ClientAddressResolver clientAddressResolver;
 
-    public ConversationController(ConversationService conversationService) {
+    public ConversationController(
+            ConversationService conversationService,
+            AuditService auditService,
+            ClientAddressResolver clientAddressResolver
+    ) {
         this.conversationService = conversationService;
+        this.auditService = auditService;
+        this.clientAddressResolver = clientAddressResolver;
     }
 
     @GetMapping
@@ -49,11 +60,28 @@ public class ConversationController {
     @DeleteMapping("/{id}")
     public Mono<ResponseEntity<Map<String, Boolean>>> delete(
             @RequestHeader("X-User-ID") String userId,
-            @PathVariable String id
+            @PathVariable String id,
+            ServerWebExchange exchange
     ) {
-        return Mono.fromCallable(() -> conversationService.delete(userId, id))
-                .subscribeOn(Schedulers.boundedElastic())
-                .map(deleted -> ResponseEntity.ok(Map.of("deleted", deleted)));
+        return Mono.fromCallable(() -> {
+                    boolean deleted = conversationService.delete(userId, id);
+                    // Deleting a conversation removes its messages: an administrative action
+                    // worth an audit row, unlike reading the conversation list.
+                    auditService.record(
+                            AuditService.Context.user(
+                                    userId,
+                                    clientAddressResolver.resolve(exchange.getRequest()),
+                                    null
+                            ),
+                            "conversation.delete",
+                            "conversation",
+                            id,
+                            deleted ? AuditService.OUTCOME_SUCCESS : AuditService.OUTCOME_FAILURE,
+                            Map.of("deleted", deleted)
+                    );
+                    return ResponseEntity.ok(Map.of("deleted", deleted));
+                })
+                .subscribeOn(Schedulers.boundedElastic());
     }
 
     @PatchMapping("/{id}")

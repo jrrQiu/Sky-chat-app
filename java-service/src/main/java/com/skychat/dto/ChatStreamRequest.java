@@ -1,8 +1,5 @@
 package com.skychat.dto;
 
-import java.util.ArrayList;
-import java.util.List;
-
 public class ChatStreamRequest {
     private String content;
     private String conversationId;
@@ -12,7 +9,6 @@ public class ChatStreamRequest {
     private String model;
     private boolean enableThinking;
     private boolean enableWebSearch;
-    private List<ChatMessageInput> messages = new ArrayList<>();
 
     public String getContent() {
         return content;
@@ -78,11 +74,4 @@ public class ChatStreamRequest {
         this.enableWebSearch = enableWebSearch;
     }
 
-    public List<ChatMessageInput> getMessages() {
-        return messages;
-    }
-
-    public void setMessages(List<ChatMessageInput> messages) {
-        this.messages = messages == null ? new ArrayList<>() : messages;
-    }
 }

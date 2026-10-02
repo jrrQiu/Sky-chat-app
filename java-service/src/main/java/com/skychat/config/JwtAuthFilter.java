@@ -1,6 +1,8 @@
 package com.skychat.config;
 
 import com.skychat.service.JwtService;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -14,7 +16,15 @@ import reactor.core.publisher.Mono;
 
 import java.nio.charset.StandardCharsets;
 
+/**
+ * Authenticates the end-user bearer token and surfaces the identity as {@code X-User-ID} and
+ * {@code X-User-Roles} for downstream filters and controllers.
+ *
+ * <p>The order matters: the rate-limit filter keys on the authenticated user, so this must run
+ * first.</p>
+ */
 @Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
 public class JwtAuthFilter implements WebFilter {
     private final JwtService jwtService;
 
@@ -42,6 +52,7 @@ public class JwtAuthFilter implements WebFilter {
             ServerHttpRequest mutatedRequest = exchange.getRequest()
                     .mutate()
                     .header("X-User-ID", claims.userId())
+                    .header("X-User-Roles", String.join(",", claims.roles()))
                     .build();
             return chain.filter(exchange.mutate().request(mutatedRequest).build());
         } catch (IllegalArgumentException error) {

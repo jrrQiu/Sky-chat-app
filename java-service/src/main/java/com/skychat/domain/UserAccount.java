@@ -1,12 +1,15 @@
 package com.skychat.domain;
 
 import java.time.LocalDateTime;
+import java.util.Arrays;
+import java.util.List;
 
 public class UserAccount {
     private String id;
     private String email;
     private String name;
     private String passwordHash;
+    private String roles;
     private LocalDateTime createdAt;
 
     public String getId() {
@@ -39,6 +42,24 @@ public class UserAccount {
 
     public void setPasswordHash(String passwordHash) {
         this.passwordHash = passwordHash;
+    }
+
+    public String getRoles() {
+        return roles;
+    }
+
+    public void setRoles(String roles) {
+        this.roles = roles;
+    }
+
+    public List<String> getRolesList() {
+        if (roles == null || roles.isBlank()) {
+            return List.of("employee");
+        }
+        return Arrays.stream(roles.split(","))
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .toList();
     }
 
     public LocalDateTime getCreatedAt() {

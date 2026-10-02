@@ -3,11 +3,12 @@ package com.skychat.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.skychat.domain.Conversation;
-import com.skychat.dto.ChatMessageInput;
+import com.skychat.domain.Message;
 import com.skychat.dto.ChatStreamRequest;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.LinkedHashMap;
@@ -22,26 +23,36 @@ public class ChatStreamService {
     private final AgentGatewayClient agentGatewayClient;
     private final MessageService messageService;
     private final ConversationService conversationService;
+    private final ConversationContextService conversationContextService;
+    private final ConversationSummaryService conversationSummaryService;
     private final RunEventStore runEventStore;
+    private final ApprovalIngestService approvalIngestService;
     private final ObjectMapper objectMapper;
 
     public ChatStreamService(
             AgentGatewayClient agentGatewayClient,
             MessageService messageService,
             ConversationService conversationService,
+            ConversationContextService conversationContextService,
+            ConversationSummaryService conversationSummaryService,
             RunEventStore runEventStore,
+            ApprovalIngestService approvalIngestService,
             ObjectMapper objectMapper
     ) {
         this.agentGatewayClient = agentGatewayClient;
         this.messageService = messageService;
         this.conversationService = conversationService;
+        this.conversationContextService = conversationContextService;
+        this.conversationSummaryService = conversationSummaryService;
         this.runEventStore = runEventStore;
+        this.approvalIngestService = approvalIngestService;
         this.objectMapper = objectMapper;
     }
 
     public Flux<ServerSentEvent<String>> stream(
             ChatStreamRequest request,
             String userId,
+            List<String> roles,
             int afterSeq,
             String runId,
             String conversationId
@@ -67,7 +78,12 @@ public class ChatStreamService {
                 resolvedConversationId = conversation.getId();
             }
 
-            messageService.create(userId, resolvedConversationId, "user", latestUserMessage);
+            Message userMessage = messageService.create(
+                    userId,
+                    resolvedConversationId,
+                    "user",
+                    latestUserMessage
+            );
 
             AtomicReference<String> assistantText = new AtomicReference<>("");
             AtomicReference<String> title = new AtomicReference<>("");
@@ -77,16 +93,25 @@ public class ChatStreamService {
             Map<String, Object> agentPayload = buildAgentPayload(
                     request,
                     userId,
+                    roles,
                     runId,
                     finalConversationId,
-                    latestUserMessage
+                    latestUserMessage,
+                    userMessage == null ? request.getUserMessageId() : userMessage.getId()
             );
 
-            return agentGatewayClient.stream(agentPayload, userId)
+            return agentGatewayClient.stream(agentPayload, userId, roles)
                     .map(event -> {
                         String data = event.data() == null ? "" : event.data();
                         int seq = runEventStore.append(runId, data);
                         accumulateEvent(data, assistantText, title, failed);
+                        // Runs on boundedElastic, so blocking JDBC ingestion is acceptable.
+                        approvalIngestService.record(
+                                userId,
+                                runId,
+                                finalConversationId,
+                                data
+                        );
                         return ServerSentEvent.<String>builder(data)
                                 .id(String.valueOf(Math.max(seq, 0)))
                                 .event("message")
@@ -100,36 +125,83 @@ public class ChatStreamService {
                                 assistantText.get(),
                                 title.get()
                         );
+                        Mono.fromRunnable(() -> conversationSummaryService.roll(finalConversationId))
+                                .subscribeOn(Schedulers.boundedElastic())
+                                .subscribe();
                     })
-                    .doOnError(error -> {
-                        String message = error instanceof Exception
-                                ? error.getMessage()
-                                : String.valueOf(error);
+                    .onErrorResume(error -> {
+                        String message = safeErrorMessage(error);
                         runEventStore.fail(runId, message);
+                        persistAssistantTurn(
+                                userId,
+                                finalConversationId,
+                                assistantText.get(),
+                                title.get()
+                        );
+                        return Flux.just(createErrorEvent(message));
                     })
                     .subscribeOn(Schedulers.boundedElastic());
         });
     }
 
+    private String safeErrorMessage(Throwable error) {
+        if (error == null) {
+            return "Agent 服务调用失败";
+        }
+        String message = error.getMessage();
+        return message == null || message.isBlank()
+                ? error.getClass().getSimpleName()
+                : message;
+    }
+
+    private ServerSentEvent<String> createErrorEvent(String message) {
+        try {
+            String data = objectMapper.writeValueAsString(Map.of(
+                    "type", "error",
+                    "message", message
+            ));
+            return ServerSentEvent.<String>builder(data)
+                    .event("message")
+                    .build();
+        } catch (Exception error) {
+            return ServerSentEvent.<String>builder(
+                            "{\"type\":\"error\",\"message\":\"Agent 服务调用失败\"}"
+                    )
+                    .event("message")
+                    .build();
+        }
+    }
+
     private Map<String, Object> buildAgentPayload(
             ChatStreamRequest request,
             String userId,
+            List<String> roles,
             String runId,
             String conversationId,
-            String latestUserMessage
+            String latestUserMessage,
+            String userMessageId
     ) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("request_id", runId);
-        payload.put("user_context", Map.of("userId", userId));
+        payload.put("user_context", Map.of(
+                "userId", userId,
+                "roles", roles == null ? List.of("employee") : roles
+        ));
         payload.put("conversation_id", conversationId);
-        payload.put("user_message_id", request.getUserMessageId());
-        payload.put("assistant_message_id", request.getAiMessageId());
-        payload.put("messages", request.getMessages());
+        // The agent service requires both ids. They are correlation handles, so a
+        // caller that omits one gets a generated value rather than an opaque 422
+        // surfaced as "Agent 服务调用失败".
+        payload.put("user_message_id", fallbackId(userMessageId));
+        payload.put("assistant_message_id", fallbackId(request.getAiMessageId()));
         payload.put("latest_user_message", latestUserMessage);
         payload.put("model", request.getModel());
         payload.put("api_key", "");
         payload.put("enable_thinking", request.isEnableThinking());
         payload.put("enable_web_search", request.isEnableWebSearch());
+        payload.put("context_envelope", conversationContextService.build(
+                userId,
+                conversationId
+        ));
         payload.put("agent_state", Map.of(
                 "requestId", runId,
                 "userContext", Map.of("userId", userId),
@@ -141,14 +213,6 @@ public class ChatStreamService {
     private String latestUserMessage(ChatStreamRequest request) {
         if (request.getContent() != null && !request.getContent().isBlank()) {
             return request.getContent().trim();
-        }
-
-        List<ChatMessageInput> messages = request.getMessages();
-        for (int index = messages.size() - 1; index >= 0; index -= 1) {
-            ChatMessageInput message = messages.get(index);
-            if ("user".equals(message.getRole()) && message.getContent() != null) {
-                return message.getContent().trim();
-            }
         }
         return "";
     }
@@ -190,8 +254,12 @@ public class ChatStreamService {
         }
     }
 
-    public static String normalizeRunId(String runId) {
-        if (runId != null && !runId.isBlank()) {
+    /** The agent service requires a non-blank correlation id for both roles. */
+    private static String fallbackId(String value) {
+        return value == null || value.isBlank() ? "msg_" + UUID.randomUUID() : value;
+    }
+
+    public static String normalizeRunId(String runId) {        if (runId != null && !runId.isBlank()) {
             return runId.trim();
         }
         return "run_" + UUID.randomUUID();
