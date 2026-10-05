@@ -949,6 +949,74 @@ on_behalf_of: <申请人 id>
 - **没有"撤销已批准"**；`approval_task.result` 仍不可依赖。
 - **合并的编号解析是正则**（"把 #12 合并到 #14" 的顺序即源→目标），仍无 function calling。
 
+---
+
+## 21. 清掉桩工具，接上 function calling
+
+### 21.1 桩工具已全部删除
+
+删掉的：`idp`、`mdm`、`software_center`、`vpn_api`、`cmdb`、`permission_system`、`hris`、
+`organization_service`、`form_service`、`erp`、`ocr`、`budget_service`、`pgvector`、
+`elasticsearch`、`reranker`、`rule_engine`、`temporal`、`notification_system`、`rbac`、`dlp`、
+`audit_service`、`agent_registry`、`policy_api`——以及 `mock.py`（整个 mock 适配器）、
+`graph/nodes/approval.py`（从未接线的死代码，却持有**第二份**动作映射并引用了已删除的动作）。
+
+| 后果 | 说明 |
+|---|---|
+| **没有 mock 提供方了** | 未实现的工具由 `RefusingToolAdapter` 明确拒绝（`TOOL_NOT_IMPLEMENTED`），而不是返回编造的成功。工具没实现就**不能被调用** |
+| **结果里的 `simulated` 标志消失** | 因为已经没有"模拟"这回事了 |
+| **新权限模型** | 旧的域权限（`it:password_reset`、`network:access:read`…）存在的唯一目的就是给已删除的桩当门禁。现在 agent 准入是 `service:request`（所有已认证角色都有），**凡改变状态的操作一律逐工具授权**（`ticket:merge` 只有 staff 有） |
+| **agent 不再有两份工具清单** | `agents.yaml` 与 catalog 的一致性由测试守住：声明了 catalog 里没有的工具会直接失败 |
+
+**一个真正重要的一致性修正**：同一个事实原先写在四个地方（mock 处理器表、per-agent 工具表、
+`TOOL_PERMISSIONS`、护栏参数白名单），它们已经漂移——`ticket_merge` 就带着被自己安全护栏拒绝的
+参数上线了。现在**一切都从 `app/tools/catalog.py` 的一个条目派生**：权限、给模型的 JSON Schema、
+护栏的允许参数清单。测试逐工具断言这三者一致。
+
+### 21.2 function calling 已接入
+
+| 设计点 | 理由 |
+|---|---|
+| 模型只看得到 **`direct_tools()`**（4 个）：`ticket_create`/`ticket_list`/`ticket_get`/`ticket_comment` | **审批门控的 `ticket_merge` 永不交给模型**。它仍由意图分类法 + 审批门驱动，所以模型永远不可能成为破坏性动作执行的原因 |
+| 候选先经 `authorize_tool` + agent 允许清单过滤 | 不给模型看它会（也应该）被拒绝的工具 |
+| 模型的调用是**请求，不是授权** | 三道门在事后照样执行：agent 允许清单、用户权限、参数 schema。测试断言模型塞入 `priority` 会被护栏整体拒绝 |
+| `tool_choice: "auto"` | "直接回答"必须仍是选项，否则每一轮都会建单 |
+| 模型不可用时**回落到规则**，并在 `/ready` 说明 | `tools.routing` 同时报 `configured` 与 `lastObserved`，以及 `fellBack`。只报"配置为模型选择"而实际在跑回落，就是在撒谎 |
+| 模型选择不改变执行语义 | `tool_call` 事件新增 `chosenBy: model|rule-based`，审计与护栏路径完全相同 |
+
+### 21.3 验证
+
+| 层次 | 结果 |
+|---|---|
+| Java 单测 | **217 项全绿** |
+| Python 单测 | **330 项全绿**（新增 31：catalog 单源一致性、护栏按 catalog 拒绝自造参数、门控工具不交给模型、仅 staff 可合并、未实现工具拒绝、请求构造与 `tool_calls` 解析（含畸形条目丢弃）、无模型时拒绝而非假装、`configured` 与 `lastObserved` 的区分、模型选择落库为真工单、模型塞参数被拒、审计者只能看到 `ticket_list`、模型失败回落、门控工具无法从该节点抵达、模型不选就不建单） |
+| 实时端到端 | **22 项通过 / 0 失败** |
+| 前端 / 数据库 | `tsc` 0 错误；schema 漂移 PASS |
+
+实时结果（真实 PostgreSQL、两个服务、真实模型）：
+
+- **桩的编造文案彻底消失**：`我的账号被锁了，帮我重置密码` 过去返回硬编码的"已生成密码重置链接"
+  与编造的 `IT-IDP-10086`；现在**建出真实工单 #25**（`type=request`），且全部 10 个旧文案串
+  一个都没出现。
+- **模型在选工具**：`tool_call: ticket_create, chosenBy=['model']` → **真实工单 #26**
+  （`source=chat`、申请人是本人）；追问"我的工单现在什么状态？"→ 只选 `ticket_list`，
+  不重复建单。
+- **`/ready` 如实**：`implemented` 只有 5 个工单工具、`declared_unimplemented` 为空、
+  `modelCallable` 不含 `ticket_merge`；`routing = {configured: model, lastObserved: model, fellBack: false}`。
+
+### 21.4 仍未做（诚实清单）
+
+- **只有工单一个系统**：catalog 里 5 个工具全部指向 Java 工单服务。`authority=system` 仍无生产动作。
+- **`ticket_get` / `ticket_comment` 仍未接给任何 agent**（`implemented_not_wired`）：模型看得到
+  它们的 schema（它们不是门控工具），但没有任何 agent 声明，所以候选清单里不会出现。要启用只需在
+  `agents.yaml` 加一行——不过我倾向先想清楚"agent 主动给工单写备注"的产品语义。
+- **function calling 只有单轮**：模型选一次工具、执行、然后由 `generate_answer` 回复；
+  **没有把工具结果回灌给模型再让它续选**的多轮循环。对当前 5 个工具够用，但不是完整的 agentic loop。
+- **合并编号仍是正则解析**（在适配器里），且合并仍由意图分类法触发，不走模型。
+- **知识的 `pgvector`/`elasticsearch`/`reranker` 不是工具**：知识检索一直由 `retrieve_knowledge`
+  节点与检索管线完成，删掉的只是三个从未被任何路径选中的同名桩。
+- `corpus.py` 里的知识文档仍提到 IdP/ERP——那是**文档内容**（某公司的历史工单语料），不是工具，保留。
+
 
 
 
