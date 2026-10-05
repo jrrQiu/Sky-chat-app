@@ -94,6 +94,31 @@ def state(**overrides):
     return value
 
 
+@pytest.fixture(autouse=True)
+def _no_decision_streaming(monkeypatch):
+    """Exercise the non-streaming seam by default.
+
+    Decision streaming is a transport choice, and it has its own test with an injected stream.
+    Turning it off here keeps the loop tests about the loop's behaviour rather than about which
+    HTTP shape the model call took.
+    """
+    monkeypatch.setattr(settings, "agent_stream_decisions", False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ledger(monkeypatch):
+    """State-changing calls now go through the effect ledger, so keep it off the database.
+
+    That indirection is the reason a replayed node cannot apply a write twice; in tests it must
+    not reach for Postgres.
+    """
+    from app.core.effect_ledger import EffectLedger
+
+    monkeypatch.setattr(tools_node, "effect_ledger", EffectLedger(postgres=None))
+    yield
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     from app.tools.adapters.ticket import TicketToolAdapter
@@ -257,6 +282,9 @@ async def test_a_second_round_can_depend_on_the_first_result(monkeypatch, adapte
 
 @pytest.mark.asyncio
 async def test_an_exact_repeat_is_refused_so_a_write_cannot_happen_twice(monkeypatch, adapter):
+    # The stop-after-write rule would end the loop before the repeat; disabling it proves the
+    # fingerprint guard is what actually protects the write.
+    monkeypatch.setattr(settings, "agent_stop_after_write", False)
     monkeypatch.setattr(
         tools_node,
         "converse",
@@ -275,20 +303,39 @@ async def test_an_exact_repeat_is_refused_so_a_write_cannot_happen_twice(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_different_call_in_a_later_round_is_still_allowed(monkeypatch, adapter):
+async def test_a_successful_write_ends_the_loop(monkeypatch, adapter):
+    # A write *is* the outcome; another round could only duplicate it or read what the answer can
+    # already be written from.
     monkeypatch.setattr(
         tools_node,
         "converse",
         scripted(
             turn(("ticket_create", {"title": "打印机坏了"})),
-            turn(("ticket_create", {"title": "另一个问题"})),
+            turn(("ticket_list", {"limit": 5})),
+        ),
+    )
+
+    result = await tools_node.execute_tools(state())
+
+    assert [name for name, _ in adapter] == ["ticket_create"]
+    assert result["tool_rounds"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_different_read_in_a_later_round_is_still_allowed(monkeypatch, adapter):
+    monkeypatch.setattr(
+        tools_node,
+        "converse",
+        scripted(
+            turn(("ticket_list", {"limit": 5})),
+            turn(("ticket_list", {"limit": 20})),
         ),
     )
 
     await tools_node.execute_tools(state())
 
     # Suppression is by exact arguments, not by tool name, so a genuinely different call runs.
-    assert [name for name, _ in adapter] == ["ticket_create", "ticket_create"]
+    assert [name for name, _ in adapter] == ["ticket_list", "ticket_list"]
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,10 @@ agents:
       # Read-only, and the reason the agent loop earns its keep: "list my tickets, then show me
       # that one" is two calls where the second depends on the first.
       - ticket_get
+      # Public replies only, and only when the user dictates the content -- the agent records
+      # what the user said rather than speaking for them. Internal notes stay a human action in
+      # the tickets UI; `visibility` is not even in this tool's schema.
+      - ticket_comment
       # Approval-gated and destructive: reachable only through the approval gate, never offered
       # to the model (see `tools/catalog.py` and the assertion in tests/test_action_registry.py).
       - ticket_merge
@@ -49,6 +53,7 @@ agents:
       - ticket_create
       - ticket_list
       - ticket_get
+      - ticket_comment
       - ticket_merge
     permissions:
       - service:request
@@ -62,6 +67,7 @@ agents:
       - ticket_create
       - ticket_list
       - ticket_get
+      - ticket_comment
       - ticket_merge
     permissions:
       - service:request
@@ -75,6 +81,7 @@ agents:
       - ticket_create
       - ticket_list
       - ticket_get
+      - ticket_comment
       - ticket_merge
     permissions:
       - service:request

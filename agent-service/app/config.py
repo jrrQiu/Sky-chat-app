@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     # and, with real writes, into repeated effects.
     agent_max_rounds: int = 3
     agent_max_tool_calls: int = 6
+    # Total tokens the loop may spend before it stops choosing tools and answers with what it
+    # has. 0 disables the check (the call caps still apply).
+    agent_token_budget: int = 20000
+    # Stop after a successful state-changing call: the write *is* the outcome, and another round
+    # could only add duplicate writes or reads the answer can already be written from.
+    agent_stop_after_write: bool = True
+    # Stream the tool *decision* so the user sees the reasoning as it happens instead of a
+    # generic "thinking" line. Costs one streaming request per round.
+    agent_stream_decisions: bool = True
     # When an approved high-risk action has no integrated target system, register the
     # approved work as a change ticket in our own system of record. The external action
     # still reports as not executed; this only ensures the approval leaves a trace.

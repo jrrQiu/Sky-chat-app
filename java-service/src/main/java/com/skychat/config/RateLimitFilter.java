@@ -192,8 +192,28 @@ public class RateLimitFilter implements WebFilter {
         });
     }
 
+    /**
+     * Continue the chain, or answer with 429 -- but always answer.
+     *
+     * <p>This used to return {@code Mono.empty()} when the request was limited, without writing
+     * anything. The response then completed unwritten, which Netty reports to the client as
+     * **HTTP 200 with an empty body**: a client cannot tell that from a successful call, and for
+     * {@code /v1/auth/login} it looks like a login that returned no token. Observed as "after the
+     * limit trips once, every subsequent login returns 200 with no body".</p>
+     */
     private Mono<Void> proceedOrLimit(ServerWebExchange exchange, WebFilterChain chain) {
-        return Mono.defer(() -> isLimited(exchange) ? Mono.empty() : chain.filter(exchange));
+        return Mono.defer(() -> {
+            if (!isLimited(exchange)) {
+                return chain.filter(exchange);
+            }
+            Object attribute = exchange.getAttributes().get(LIMITED_ATTRIBUTE);
+            // Guarded because another branch may already have written the denial; writing twice
+            // on a committed response is what tears a connection down.
+            if (attribute instanceof RateLimitResult result && !exchange.getResponse().isCommitted()) {
+                writeLimited(exchange, result);
+            }
+            return Mono.empty();
+        });
     }
 
     /**

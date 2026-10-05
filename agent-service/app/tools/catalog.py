@@ -81,14 +81,18 @@ TOOLS: dict[str, ToolSpec] = {
     "ticket_comment": ToolSpec(
         name="ticket_comment",
         description=(
-            "在工单上追加一条回复。visibility=public 对申请人可见；"
-            "visibility=internal 是内部备注，仅处理人可见。"
+            "在工单上追加一条**公开**回复，用于把用户自己说出的补充信息记录到工单上。"
+            "只有当用户明确要求记录、并给出内容时才调用；不要替用户编造内容。"
         ),
         parameters={
             "number": {"type": "integer", "description": "工单编号"},
             "ticketId": {"type": "string"},
-            "body": {"type": "string", "description": "回复内容"},
-            "visibility": {"type": "string", "enum": ["public", "internal"]},
+            # `visibility` is deliberately absent. The agent may only post public replies: an
+            # internal note is a human action in the tickets UI, because "hidden from the
+            # requester" is not something an assistant should be able to do on someone's behalf.
+            # Removing it from the schema also means the guardrail rejects it if the model
+            # invents it, rather than silently downgrading.
+            "body": {"type": "string", "description": "回复内容，取自用户原话"},
         },
         required=("body",),
         permission="ticket:comment",
