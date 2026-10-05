@@ -1,3 +1,5 @@
+import logging
+import time
 import uuid
 from typing import Any
 
@@ -14,7 +16,17 @@ from app.persistence.approval_store import (
     approval_store,
 )
 from app.registry.rbac import authorize_agent, authorize_tool
-from app.tools.actions import ACTIONS, action_key, describe_outcome, resolve as resolve_action
+from app.tools.actions import (
+    ACTIONS,
+    AUTHORITY_SYSTEM,
+    action_key,
+    describe_outcome,
+    evaluate_system_authority,
+    refusal_message,
+)
+from app.tools.actions import resolve as resolve_action
+
+logger = logging.getLogger(__name__)
 from app.tools.adapters import get_tool_adapter
 
 
@@ -297,6 +309,41 @@ async def prepare_approval(
     }
 
 
+async def _system_authority(
+    state: dict[str, Any],
+    action: Any,
+    approval_id: str | None,
+):
+    """Read the approval of record and decide whether it authorizes a system execution.
+
+    The store is consulted rather than the graph state on purpose: the state carries the
+    decision that was made when the run was interrupted, while the store carries the decision
+    that stands now. For an elevation path the difference matters.
+    """
+    task = None
+    if approval_id:
+        try:
+            task = await approval_store.get(approval_id)
+        except Exception as exc:  # a store we cannot read must not become an authorization
+            logger.warning("Could not read approval %s: %s", approval_id, exc)
+            task = None
+
+    status = getattr(task.status, "value", task.status) if task else None
+    return evaluate_system_authority(
+        action,
+        approval_id=approval_id,
+        approval_status=str(status) if status is not None else None,
+        decided_by=task.decided_by if task else None,
+        approval_action=(task.resume_payload or {}).get("pending_action") if task else None,
+        consumed_at=task.consumed_at if task else None,
+        created_at=task.created_at if task else None,
+        approval_requester=task.user_id if task else None,
+        requester=str(state.get("user_id") or "") or None,
+        now=time.time(),
+        ttl_seconds=settings.system_action_approval_ttl_seconds,
+    )
+
+
 async def execute_approved_action(
     state: dict[str, Any],
     config: RunnableConfig | None = None,
@@ -336,12 +383,40 @@ async def execute_approved_action(
             "status": "resuming",
         }
 
-    if not authorize_tool(state.get("user_context"), selected_agent, pending_action):
-        # The write is authorized against the *requester's* authority, not the approver's: an
-        # approval adds a second signature, it does not grant a permission the requester never
-        # held. That is deliberate (approvals must not become a privilege-escalation path), but
-        # the refusal has to be visible -- it previously returned without an audit record, so an
-        # approved action that never ran left no trace beyond the approval row itself.
+    if requested_action.authority == AUTHORITY_SYSTEM:
+        # "Employee requests, administrator approves, the system provisions." The requester is
+        # not expected to hold the write permission -- that is the whole point -- so the
+        # approval is the control, and it is checked against the store (the authority of record)
+        # rather than against the graph state.
+        authority = await _system_authority(state, requested_action, approval_id)
+        if not authority.allowed:
+            message = refusal_message(requested_action, authority.reason or "UNKNOWN")
+            await record_action(
+                "tool.write",
+                object_type="tool",
+                object_id=pending_action,
+                outcome="denied",
+                actor_id=str(state.get("user_id") or "") or None,
+                detail={
+                    "turn_id": turn_id,
+                    "approval_id": approval_id,
+                    "reason": authority.reason,
+                    "executed_as": "system",
+                    "external_executed": False,
+                },
+            )
+            if emit:
+                await emit({"type": "error", "message": message})
+            return {
+                "status": "failed",
+                "guard_error": authority.reason,
+                "final_answer": message,
+            }
+        authorizer_id = authority.authorizer_id
+    elif not authorize_tool(state.get("user_context"), selected_agent, pending_action):
+        # Dual control: the requester's own permission authorizes the action, and the approval
+        # only adds a second signature. The refusal is audited because an approved action that
+        # silently never ran must still leave a trace.
         message = f"RBAC denied write action {pending_action}"
         await record_action(
             "tool.write",
@@ -367,6 +442,8 @@ async def execute_approved_action(
                 f"该动作未执行。"
             ),
         }
+    else:
+        authorizer_id = None
 
     adapter = get_tool_adapter()
     tool_call_id = f"write_{uuid.uuid4().hex[:12]}"
@@ -498,6 +575,11 @@ async def execute_approved_action(
             "change_ticket_number": result.get("changeTicketNumber"),
             "deduplicated": bool(result.get("deduplicated")),
             "error": result.get("error"),
+            # For a system-executed action the requester is only the beneficiary; who authorized
+            # it is the fact an investigation needs, so it is recorded next to the effect.
+            "executed_as": "system" if requested_action.authority == AUTHORITY_SYSTEM else "requester",
+            "authorizer_id": authorizer_id,
+            "on_behalf_of": str(state.get("user_id") or "") or None,
         },
     )
 

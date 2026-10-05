@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     # approved work as a change ticket in our own system of record. The external action
     # still reports as not executed; this only ensures the approval leaves a trace.
     high_risk_records_change_ticket: bool = True
+    # How long an approval stays usable for a system-executed action. A system-executed
+    # action is an elevation path, so an old approval must not act as a standing warrant.
+    # 0 disables the check (not recommended).
+    system_action_approval_ttl_seconds: int = 86400
 
     retrieval_use_llm: bool = False
     retrieval_use_postgres: bool = False
