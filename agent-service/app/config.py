@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     # fallback. Requires a model API key; `/ready` reports which mode is actually in
     # effect under `tools.routing`, so the two are not confused.
     function_calling_enabled: bool = True
+    # The agent loop is bounded. An agent that can keep calling tools needs a ceiling on
+    # rounds and on total calls, or a confused model turns into an unbounded bill --
+    # and, with real writes, into repeated effects.
+    agent_max_rounds: int = 3
+    agent_max_tool_calls: int = 6
     # When an approved high-risk action has no integrated target system, register the
     # approved work as a change ticket in our own system of record. The external action
     # still reports as not executed; this only ensures the approval leaves a trace.

@@ -169,8 +169,8 @@ def test_tool_status_separates_implemented_from_declared():
     status = tool_status()
 
     assert set(status["implemented"]) == set(TOOLS)
-    # `ticket_comment`/`ticket_get` are implemented but not declared for any agent yet.
-    assert set(status["implemented_not_wired"]) == {"ticket_comment", "ticket_get"}
+    # `ticket_comment` is implemented but not declared for any agent yet.
+    assert set(status["implemented_not_wired"]) == {"ticket_comment"}
     assert status["declared_unimplemented"] == []
     assert status["adapters"]["ticket"] == "internal-http"
     # There is no mock provider: anything unimplemented refuses.

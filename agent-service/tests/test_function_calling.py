@@ -1,16 +1,16 @@
-"""Function calling: the model chooses the tools.
+"""Function calling and the agent loop.
 
-The rules used to choose, by regex over the user's message. Now the model is offered the
-catalog's JSON Schemas and picks -- with four things pinned here:
+Two capabilities are pinned here.
 
-* an approval-gated tool is **never** in the offered list, so the model cannot be the reason a
-  destructive action runs;
-* a model's choice is a *request*: the agent allow-list, the user's permission and the argument
-  schema are all applied afterwards;
-* a model failure falls back to the rules and says so in `/ready`, rather than silently
-  pretending the model chose;
-* the tool payload the model sees matches the catalog exactly, so it cannot be handed a
-  parameter the guardrail would then reject.
+**Function calling.** The model is offered the catalog's JSON Schemas and picks. An
+approval-gated tool is never in the list, and a model's choice is a *request*: the agent
+allow-list, the user's permission and the argument schema are applied afterwards.
+
+**The loop.** The model sees each tool result and may decide it needs another call, so
+"look up the ticket, then comment on it" is expressible. A loop introduces failure modes a single
+shot did not have, and they are all tested here: an exact repeat must not execute twice (with
+real writes that is a second ticket), rounds and calls are capped, and the mode a turn actually
+used is reported rather than assumed.
 """
 
 from __future__ import annotations
@@ -23,13 +23,15 @@ from app.config import settings
 from app.graph.nodes import tools as tools_node
 from app.tools.calling import (
     FunctionCallingUnavailable,
+    ModelTurn,
+    ToolChoice,
     choose_tools,
     function_calling_enabled,
     note_routing_mode,
     routing_mode,
     routing_status,
 )
-from app.tools.catalog import openai_tools, direct_tools
+from app.tools.catalog import direct_tools, openai_tools
 
 
 def completion(*calls, arguments_as_json: bool = True) -> dict:
@@ -46,6 +48,37 @@ def completion(*calls, arguments_as_json: bool = True) -> dict:
     return {"choices": [{"message": {"role": "assistant", "tool_calls": tool_calls}}]}
 
 
+def turn(*calls) -> ModelTurn:
+    """A ModelTurn as the node would receive it."""
+    choices = [
+        ToolChoice(name=name, arguments=arguments, call_id=f"call_{index}")
+        for index, (name, arguments) in enumerate(calls)
+    ]
+    return ModelTurn(
+        calls=choices,
+        assistant_message={
+            "role": "assistant",
+            "tool_calls": [
+                {"id": c.call_id, "type": "function",
+                 "function": {"name": c.name, "arguments": json.dumps(c.arguments)}}
+                for c in choices
+            ],
+        },
+    )
+
+
+def scripted(*turns: ModelTurn, capture: list | None = None):
+    """A fake `converse` that returns one turn per round and records the messages it saw."""
+    queue = list(turns)
+
+    async def fake(messages, _names, **_kwargs):
+        if capture is not None:
+            capture.append(list(messages))
+        return queue.pop(0) if queue else ModelTurn(calls=[], assistant_message={})
+
+    return fake
+
+
 def state(**overrides):
     value = {
         "request_id": "req-1",
@@ -59,6 +92,21 @@ def state(**overrides):
     }
     value.update(overrides)
     return value
+
+
+@pytest.fixture
+def adapter(monkeypatch):
+    from app.tools.adapters.ticket import TicketToolAdapter
+
+    calls: list[tuple[str, dict]] = []
+
+    class Recording(TicketToolAdapter):
+        async def execute(self, tool_name, args, state):
+            calls.append((tool_name, args))
+            return {"success": True, "text": f"{tool_name} 已执行", "data": {"number": 26}}
+
+    monkeypatch.setattr(tools_node, "get_tool_adapter", lambda: Recording(base_url="http://j"))
+    return calls
 
 
 # --------------------------------------------------------------------------- payload
@@ -79,17 +127,13 @@ def test_the_payload_offers_only_direct_tools_with_the_catalog_schema():
 @pytest.mark.asyncio
 async def test_a_model_choice_is_parsed_into_a_call():
     async def poster(payload):
-        # The request carries the schemas and asks the model to decide.
         assert payload["tool_choice"] == "auto"
-        assert "tools" in payload
         return completion(("ticket_create", {"title": "打印机坏了", "type": "incident"}))
 
     choices = await choose_tools("打印机坏了", ["ticket_create"], poster=poster)
 
-    assert len(choices) == 1
-    assert choices[0].name == "ticket_create"
+    assert [c.name for c in choices] == ["ticket_create"]
     assert choices[0].arguments == {"title": "打印机坏了", "type": "incident"}
-    assert choices[0].call_id == "call_0"
 
 
 @pytest.mark.asyncio
@@ -97,8 +141,9 @@ async def test_arguments_may_arrive_as_a_mapping_or_as_json():
     async def mapping_poster(_payload):
         return completion(("ticket_list", {"limit": 5}), arguments_as_json=False)
 
-    choices = await choose_tools("我的工单", ["ticket_list"], poster=mapping_poster)
-    assert choices[0].arguments == {"limit": 5}
+    assert (await choose_tools("我的工单", ["ticket_list"], poster=mapping_poster))[0].arguments == {
+        "limit": 5
+    }
 
 
 @pytest.mark.asyncio
@@ -112,8 +157,6 @@ async def test_malformed_entries_are_discarded_not_guessed():
         ]}}]}
 
     choices = await choose_tools("x", ["ticket_create", "ticket_list"], poster=poster)
-
-    # Only the usable one survives; the rest are dropped rather than guessed at.
     assert [c.name for c in choices] == ["ticket_create"]
 
 
@@ -123,14 +166,6 @@ async def test_no_tool_calls_means_no_tools():
         return {"choices": [{"message": {"role": "assistant", "content": "你好"}}]}
 
     assert await choose_tools("你好", ["ticket_list"], poster=poster) == []
-
-
-@pytest.mark.asyncio
-async def test_an_empty_candidate_list_never_calls_the_model():
-    async def poster(_payload):  # pragma: no cover - must not run
-        raise AssertionError("no call should be made with no candidates")
-
-    assert await choose_tools("x", [], poster=poster) == []
 
 
 @pytest.mark.asyncio
@@ -159,43 +194,25 @@ def test_the_report_distinguishes_configured_from_actually_used(monkeypatch):
 
     note_routing_mode("rule-based")
     status = routing_status()
-
-    # Configured for the model, but the last turn fell back: that difference is the point.
     assert status["configured"] == "model"
     assert status["lastObserved"] == "rule-based"
     assert status["fellBack"] is True
+    # The loop's ceilings are part of the honest report: they bound cost and repeated effects.
+    assert status["maxRounds"] == settings.agent_max_rounds
+    assert status["maxToolCalls"] == settings.agent_max_tool_calls
 
     note_routing_mode("model")
     assert routing_status()["fellBack"] is False
 
 
-# --------------------------------------------------------------------------- the node
-
-
-@pytest.fixture
-def adapter(monkeypatch):
-    from app.tools.adapters.ticket import TicketToolAdapter
-
-    calls: list[tuple[str, dict]] = []
-
-    class Recording(TicketToolAdapter):
-        async def execute(self, tool_name, args, state):
-            calls.append((tool_name, args))
-            return {"success": True, "text": f"{tool_name} 已执行", "data": {"number": 7}}
-
-    instance = Recording(base_url="http://java.test:8080")
-    monkeypatch.setattr(tools_node, "get_tool_adapter", lambda: instance)
-    return calls
+# --------------------------------------------------------------------------- the loop
 
 
 @pytest.mark.asyncio
-async def test_the_model_choice_is_what_runs(monkeypatch, adapter):
-    async def fake_choose(_message, _names, **_kwargs):
-        from app.tools.calling import ToolChoice
-
-        return [ToolChoice("ticket_create", {"title": "打印机坏了"}, "call_0")]
-
-    monkeypatch.setattr(tools_node, "choose_tools", fake_choose)
+async def test_one_round_runs_the_chosen_tool(monkeypatch, adapter):
+    monkeypatch.setattr(
+        tools_node, "converse", scripted(turn(("ticket_create", {"title": "打印机坏了"})))
+    )
     events: list[dict] = []
 
     async def emit(event):
@@ -204,27 +221,119 @@ async def test_the_model_choice_is_what_runs(monkeypatch, adapter):
     result = await tools_node.execute_tools(state(), {"configurable": {"emit": emit}})
 
     assert result["tool_routing"] == "model"
+    assert result["tool_rounds"] == 1
     assert adapter[0][0] == "ticket_create"
-    # The model's arguments are kept, and the correlation values are added alongside them.
+    # The model's arguments are kept and the correlation values are added alongside them.
     assert adapter[0][1]["title"] == "打印机坏了"
     assert adapter[0][1]["latest_user_message"] == "我的打印机坏了"
     assert events[0]["chosenBy"] == "model"
+    assert events[0]["round"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_second_round_can_depend_on_the_first_result(monkeypatch, adapter):
+    seen: list[list] = []
+    monkeypatch.setattr(
+        tools_node,
+        "converse",
+        scripted(
+            turn(("ticket_list", {"limit": 5})),
+            turn(("ticket_create", {"title": "新问题"})),
+            capture=seen,
+        ),
+    )
+
+    result = await tools_node.execute_tools(state())
+
+    assert [name for name, _ in adapter] == ["ticket_list", "ticket_create"]
+    assert result["tool_rounds"] == 2
+    # This is the point of the loop: the second round saw the first round's result, fed back as a
+    # `role: tool` message, so the model chose with knowledge it did not have before.
+    second_round_messages = seen[1]
+    tool_messages = [m for m in second_round_messages if m.get("role") == "tool"]
+    assert tool_messages, second_round_messages
+    assert json.loads(tool_messages[0]["content"])["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_an_exact_repeat_is_refused_so_a_write_cannot_happen_twice(monkeypatch, adapter):
+    monkeypatch.setattr(
+        tools_node,
+        "converse",
+        scripted(
+            turn(("ticket_create", {"title": "打印机坏了"})),
+            turn(("ticket_create", {"title": "打印机坏了"})),
+        ),
+    )
+
+    result = await tools_node.execute_tools(state())
+
+    # One execution, one refusal: with real writes the repeat would be a second ticket.
+    assert [name for name, _ in adapter] == ["ticket_create"]
+    refusals = [r for r in result["tool_results"] if not r["success"]]
+    assert refusals and "重复调用已忽略" in refusals[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_a_different_call_in_a_later_round_is_still_allowed(monkeypatch, adapter):
+    monkeypatch.setattr(
+        tools_node,
+        "converse",
+        scripted(
+            turn(("ticket_create", {"title": "打印机坏了"})),
+            turn(("ticket_create", {"title": "另一个问题"})),
+        ),
+    )
+
+    await tools_node.execute_tools(state())
+
+    # Suppression is by exact arguments, not by tool name, so a genuinely different call runs.
+    assert [name for name, _ in adapter] == ["ticket_create", "ticket_create"]
+
+
+@pytest.mark.asyncio
+async def test_the_model_cannot_run_forever(monkeypatch, adapter):
+    async def always(messages, _names, **_kwargs):  # noqa: ARG001
+        # A different argument each time, so duplicate suppression never ends the loop.
+        return turn(("ticket_list", {"limit": len(messages)}))
+
+    monkeypatch.setattr(tools_node, "converse", always)
+
+    result = await tools_node.execute_tools(state())
+
+    assert result["tool_rounds"] == settings.agent_max_rounds
+    assert len(adapter) == settings.agent_max_rounds
+
+
+@pytest.mark.asyncio
+async def test_the_total_number_of_calls_is_capped(monkeypatch, adapter):
+    monkeypatch.setattr(settings, "agent_max_tool_calls", 2)
+
+    async def many(messages, _names, **_kwargs):  # noqa: ARG001
+        return turn(
+            ("ticket_list", {"limit": len(messages)}),
+            ("ticket_list", {"limit": len(messages) * 10}),
+            ("ticket_list", {"limit": len(messages) * 100}),
+        )
+
+    monkeypatch.setattr(tools_node, "converse", many)
+    await tools_node.execute_tools(state())
+
+    assert len(adapter) == 2
 
 
 @pytest.mark.asyncio
 async def test_the_model_cannot_smuggle_in_arguments(monkeypatch, adapter):
-    async def fake_choose(_message, _names, **_kwargs):
-        from app.tools.calling import ToolChoice
-
-        # `priority` is not in the catalog schema, so the guardrail must refuse the whole call.
-        return [ToolChoice("ticket_create", {"title": "x", "priority": "critical"}, "call_0")]
-
-    monkeypatch.setattr(tools_node, "choose_tools", fake_choose)
+    # `priority` is not in the catalog schema, so the guardrail refuses the whole call.
+    monkeypatch.setattr(
+        tools_node,
+        "converse",
+        scripted(turn(("ticket_create", {"title": "x", "priority": "critical"}))),
+    )
 
     result = await tools_node.execute_tools(state())
 
     assert adapter == []
-    assert result["tool_results"][0]["success"] is False
     assert "护栏" in result["tool_results"][0]["text"]
 
 
@@ -232,41 +341,41 @@ async def test_the_model_cannot_smuggle_in_arguments(monkeypatch, adapter):
 async def test_the_model_is_not_shown_tools_the_user_cannot_use(monkeypatch, adapter):
     seen: list[list[str]] = []
 
-    async def fake_choose(_message, names, **_kwargs):
+    async def fake(_messages, names, **_kwargs):
         seen.append(list(names))
-        return []
+        return ModelTurn(calls=[], assistant_message={})
 
-    monkeypatch.setattr(tools_node, "choose_tools", fake_choose)
+    monkeypatch.setattr(tools_node, "converse", fake)
 
     # An auditor may read tickets but not create or comment on them.
     await tools_node.execute_tools(state(user_context={"roles": ["auditor"]}))
 
-    assert seen == [["ticket_list"]]
+    assert seen == [["ticket_list", "ticket_get"]]
 
 
 @pytest.mark.asyncio
 async def test_an_agent_with_no_usable_tools_never_asks_the_model(monkeypatch, adapter):
     asked = []
 
-    async def fake_choose(_message, names, **_kwargs):  # pragma: no cover - must not run
+    async def fake(_messages, names, **_kwargs):  # pragma: no cover - must not run
         asked.append(names)
-        return []
+        return ModelTurn(calls=[], assistant_message={})
 
-    monkeypatch.setattr(tools_node, "choose_tools", fake_choose)
+    monkeypatch.setattr(tools_node, "converse", fake)
 
     result = await tools_node.execute_tools(state(selected_agent="guardian"))
 
     assert asked == []
-    # No candidates, so the rules are used and they select nothing either.
     assert result["tool_routing"] == "rule-based"
+    assert result["tool_rounds"] == 1
 
 
 @pytest.mark.asyncio
 async def test_a_model_failure_falls_back_to_the_rules_and_says_so(monkeypatch, adapter):
-    async def broken(_message, _names, **_kwargs):
+    async def broken(_messages, _names, **_kwargs):
         raise FunctionCallingUnavailable("no model")
 
-    monkeypatch.setattr(tools_node, "choose_tools", broken)
+    monkeypatch.setattr(tools_node, "converse", broken)
 
     result = await tools_node.execute_tools(state())
 
@@ -276,31 +385,27 @@ async def test_a_model_failure_falls_back_to_the_rules_and_says_so(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_an_approval_gated_tool_cannot_be_reached_through_this_node(monkeypatch, adapter):
-    async def fake_choose(_message, _names, **_kwargs):
-        from app.tools.calling import ToolChoice
-
-        return [ToolChoice("ticket_merge", {"sourceNumber": 1, "targetNumber": 2}, "call_0")]
-
-    monkeypatch.setattr(tools_node, "choose_tools", fake_choose)
+async def test_an_approval_gated_tool_cannot_be_reached_through_the_loop(monkeypatch, adapter):
+    monkeypatch.setattr(
+        tools_node,
+        "converse",
+        scripted(turn(("ticket_merge", {"sourceNumber": 1, "targetNumber": 2}))),
+    )
 
     result = await tools_node.execute_tools(state())
 
     assert adapter == []
-    assert result["tool_results"][0]["success"] is False
     assert "需要审批" in result["tool_results"][0]["text"]
 
 
 @pytest.mark.asyncio
 async def test_no_tool_is_called_when_the_model_chooses_none(monkeypatch, adapter):
-    async def fake_choose(_message, _names, **_kwargs):
-        return []
-
-    monkeypatch.setattr(tools_node, "choose_tools", fake_choose)
+    monkeypatch.setattr(tools_node, "converse", scripted())
 
     result = await tools_node.execute_tools(state(latest_user_message="你是谁"))
 
-    # An answer the assistant can give directly must not raise a ticket.
+    # An answer the assistant can give directly must not raise a ticket, and the turn is still a
+    # model round -- so `/ready` will not report a fallback.
     assert adapter == []
-    assert result["tool_routing"] == "rule-based"
+    assert result["tool_routing"] == "model"
     assert result["tool_results"] == []

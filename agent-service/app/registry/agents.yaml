@@ -31,6 +31,9 @@ agents:
     tools:
       - ticket_create
       - ticket_list
+      # Read-only, and the reason the agent loop earns its keep: "list my tickets, then show me
+      # that one" is two calls where the second depends on the first.
+      - ticket_get
       # Approval-gated and destructive: reachable only through the approval gate, never offered
       # to the model (see `tools/catalog.py` and the assertion in tests/test_action_registry.py).
       - ticket_merge
@@ -45,6 +48,7 @@ agents:
     tools:
       - ticket_create
       - ticket_list
+      - ticket_get
       - ticket_merge
     permissions:
       - service:request
@@ -57,6 +61,7 @@ agents:
     tools:
       - ticket_create
       - ticket_list
+      - ticket_get
       - ticket_merge
     permissions:
       - service:request
@@ -69,6 +74,7 @@ agents:
     tools:
       - ticket_create
       - ticket_list
+      - ticket_get
       - ticket_merge
     permissions:
       - service:request
@@ -80,6 +86,7 @@ agents:
     prompt_version: 1
     tools:
       - ticket_list
+      - ticket_get
     permissions:
       - knowledge:read
 
