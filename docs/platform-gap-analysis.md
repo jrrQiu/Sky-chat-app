@@ -827,6 +827,76 @@ pending_action = {"network": "vpn_api_provision", "finance": "finance_submit"}
 - **`approval_task.result` 不可依赖**（见 18.3），恢复结果的持久化待查。
 - **高风险只覆盖 `network.vpn.request` 与 `finance.service.submit`** 两类意图；`it`/`hr` 目前没有高风险意图，因此没有对应写动作。
 
+---
+
+## 19. 执行授权模型：员工申请、管理员批准、系统开通（已实现）
+
+第 18.3 节留下的那个策略问题由产品意图定案：**VPN 开通是提权路径**——员工本来就不该持有 `network:vpn:create`，审批就是授权它的那个控制项。因此授权模型从"申请人权限"改为**按动作显式声明**。
+
+### 19.1 两种模型，按动作声明
+
+| 动作 | 授权模型 | 含义 |
+|---|---|---|
+| `vpn_api_provision` | `system` | 员工申请 → 管理员批准 → **系统**执行。申请人**不需要**持有写权限，审批即授权 |
+| `finance_submit` | `requester` | 员工提交自己的报销，**必须**持有该权限，审批是加在其上的第二道签名 |
+
+关键在于这是**每个动作显式声明**的事实，而不是全局策略；`/ready` 的 `write_actions.actions[].authority` 与 `systemExecutedActions` 把它暴露出来，因为系统执行的那一类才是高风险的。
+
+### 19.2 提权通道必须窄：系统执行的七道校验
+
+把"系统账号能开通 VPN"变成现实，等于造了一个**提权能力**。所以 `evaluate_system_authority()` 是一个纯函数，逐条挡住每一种滥用方式，且**每条都有对应测试**：
+
+| 校验 | 挡住什么 | 拒绝码 |
+|---|---|---|
+| 必须有审批 id | 无审批即执行 | `APPROVAL_MISSING` |
+| 审批必须能在库中读到 | 引用失效/丢失的审批 | `APPROVAL_NOT_FOUND` |
+| **以库中的状态为准**，而非图状态 | 重放一个被撤回或过期的决定 | `APPROVAL_NOT_APPROVED` |
+| 必须记录决定人 | 无人授权的"系统自动通过" | `APPROVAL_NOT_AUTHORIZED` |
+| 审批的动作必须与本次动作一致 | **批准"重置密码"却用来开通 VPN** | `APPROVAL_ACTION_MISMATCH` |
+| 未被消费过 | 一次审批买多次效果 | `APPROVAL_ALREADY_CONSUMED` |
+| 未过期（默认 24h，可配） | 旧审批成为长期通行证 | `APPROVAL_EXPIRED` |
+| 决定人 ≠ 申请人 | **自批**使整套控制形同虚设 | `APPROVAL_SELF_DECIDED` |
+| 审批属于当前申请人 | 把别人的审批借到自己的会话里用 | `APPROVAL_REQUESTER_MISMATCH` |
+
+两层事实来源的分工值得写清楚：**授权有效性以审批库为准**（"现在的决定"），**效果一次性由幂等账本保证**（`turn_id + action`，DB 行 + 进程内锁），`consumed_at` 是纵深防御。图状态只用来取审批 id——它是"当时的决定"，对一条提权路径而言不够。
+
+### 19.3 审计回答"是谁授权的"
+
+系统执行时申请人只是**受益人**，调查真正需要的是授权人。所以 `tool.write` 的 detail 增加三个字段：
+
+```
+executed_as: "system" | "requester"
+authorizer_id: <审批人 id>        # 系统执行时必有
+on_behalf_of: <申请人 id>
+```
+
+### 19.4 顺带确认：提权通道没有从普通路径泄出
+
+系统执行的动作**只能**由 `execute_approved_action` 触发。已加测试断言 `vpn_api_provision` 不在任何 agent 的 `TOOLS_BY_AGENT` 里，也不会被 `select_tools_for_request` 选中（对 7 个 agent × 3 种说法逐一断言）——否则"员工申请"就变成了"员工直接开通"。
+
+### 19.5 验证
+
+| 层次 | 结果 |
+|---|---|
+| Java 单测 | **214 项全绿** |
+| Python 单测 | **289 项全绿**（新增 27：两种模型声明、九种拒绝路径逐一覆盖、拒绝文案、有效审批下无写权限者也可执行、审计三字段、双人复核不误标为系统执行、库不可读不等于授权、提权动作不可从普通路径选中） |
+| 实时端到端 | **36 项通过 / 0 失败**，三个场景 |
+| 前端 / 数据库 | `tsc` 0 错误；schema 漂移 PASS |
+
+实时结果（真实 PostgreSQL 与两个服务，`sa.requester` 只有 `network_user`，**本身没有写权限**）：
+
+- **场景 A（提权路径）**：员工发起申请 → 审批单 `required_approver_roles=network_admin,approver` → 管理员批准 → **没有出现 RBAC 拒绝**（模型一的阻塞已消除）→ 真实变更单 #16（关联审批单 id）→ 账本 `vpn_api_provision = failed, attempts=1` → 审计 `failure / executed_as=system / authorizer_id=<审批人> / on_behalf_of=<申请人> / external_executed=false / ACTION_NOT_IMPLEMENTED`。
+- **场景 B（拒绝）**：管理员拒绝 → 审批 `rejected` → **什么都不执行**（无变更单、无账本行、无假文案）。
+- **场景 C（一次性）**：重复决策 → 仍只有一张变更单、只有一次执行尝试。
+
+### 19.6 仍未做（诚实清单）
+
+- **VPN 系统仍未接入**：所以"系统开通"目前表现为"授权成立、外部未执行 + 真实变更单登记"。接入后要做的只有替换 `external_implemented` 并把系统凭据接进适配器——授权链路已经就位。
+- **系统凭据尚未存在**：真正的 VPN 适配器应当使用**服务账号**凭据，而不是申请人的令牌。当前唯一真实的效果（变更单）刻意以申请人身份创建，因为那**就是申请人的工单**，需要出现在他的列表里；这个区分在审计里已写明（`executed_as` 与 `on_behalf_of`）。
+- **`finance_submit` 的写权限用的是 `finance:invoice:read`**（读权限当写门禁），是既有命名遗留，未改。
+- **审批过期只在系统执行路径校验**，双人复核路径不校验（那边由申请人自己的权限兜底）。
+- **没有"撤销已批准"的流程**：批准后到执行前无法撤回。
+
 
 
 
