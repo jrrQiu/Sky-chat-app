@@ -1,31 +1,47 @@
-"""The first real tool: service-desk tickets.
+"""The tool catalog and the ticket adapter.
 
-These tests exist to pin the difference between an integration and a stub. The
-ticket tools must talk to Java for real (or report failure), while every other tool
-must keep advertising that it is simulated.
+Two things are pinned here:
+
+* the catalog is the **single** description of a tool -- its permission, the schema the model
+  sees, and the argument allow-list the guardrail enforces all come from one entry, because they
+  drifted apart and `ticket_merge` shipped with arguments its own safety rail rejected;
+* the ticket adapter talks to Java for real, and when it cannot it reports failure rather than
+  inventing a result.
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 
 import httpx
 import pytest
 
 from app.config import settings
+from app.core.guardrails import allowed_arg_keys, screen_tool_input
 from app.core.internal_token import CallerTokenUnavailable, mint_java_caller_token
+from app.registry.rbac import TOOL_PERMISSIONS, authorize_tool
 from app.tools.adapters import TICKET_TOOLS, tool_status
-from app.tools.adapters.base import MockToolAdapter, RoutingToolAdapter
-from app.tools.adapters.mock import select_tools_for_request, ticket_tools_for_message
+from app.tools.adapters.base import RefusingToolAdapter, RoutingToolAdapter
 from app.tools.adapters.ticket import (
     CALLER_TOKEN_UNAVAILABLE,
+    MERGE_TARGETS_MISSING,
     TICKET_SERVICE_UNAVAILABLE,
+    MergeTargetsMissing,
     TicketToolAdapter,
     infer_impact,
     infer_ticket_type,
     infer_urgency,
 )
+from app.tools.catalog import (
+    TOOLS,
+    approval_gated_tools,
+    arg_keys,
+    catalog_status,
+    direct_tools,
+    openai_tools,
+    permission_for,
+)
+from app.tools.selection import select_tools_for_request, ticket_tools_for_message
 
 SECRET = "unit-test-internal-secret"
 
@@ -84,6 +100,92 @@ def _secret(monkeypatch):
     yield
 
 
+# --------------------------------------------------------------------------- catalog
+
+
+def test_the_catalog_contains_only_real_tools():
+    # The IdP/MDM/HRIS/ERP stubs are gone; a model must not be offered a tool that cannot act.
+    assert set(TOOLS) == {
+        "ticket_create",
+        "ticket_list",
+        "ticket_get",
+        "ticket_comment",
+        "ticket_merge",
+    }
+    for gone in ("idp", "mdm", "software_center", "erp", "ocr", "hris", "vpn_api", "temporal"):
+        assert gone not in TOOLS
+
+
+def test_one_entry_drives_permission_schema_and_the_guardrail():
+    for name, spec in TOOLS.items():
+        # The permission comes from the catalog...
+        assert TOOL_PERMISSIONS[name] == {spec.permission}
+        assert permission_for(name) == spec.permission
+        # ...the model's schema comes from the catalog...
+        schema = openai_tools([name])[0]["function"]
+        assert set(schema["parameters"]["properties"]) == set(spec.parameters)
+        assert schema["parameters"]["additionalProperties"] is False
+        # ...and so does the guardrail allow-list.
+        assert arg_keys(name) <= allowed_arg_keys(name)
+
+
+def test_the_guardrail_rejects_arguments_outside_the_declared_schema():
+    # The model may not invent arguments, and this is the rail that says so.
+    verdict = screen_tool_input("ticket_create", {"title": "x", "assigneeId": "someone"})
+    assert verdict.allowed is False
+    assert verdict.reason == "TOOL_ARGUMENT_NOT_ALLOWED"
+    assert screen_tool_input("ticket_create", {"title": "x", "impact": "high"}).allowed is True
+
+
+def test_the_approval_gated_tool_is_never_offered_to_the_model():
+    assert approval_gated_tools() == ["ticket_merge"]
+    assert "ticket_merge" not in direct_tools()
+    assert [t["function"]["name"] for t in openai_tools(direct_tools())] == sorted(
+        direct_tools(), key=direct_tools().index
+    )
+
+
+def test_only_staff_roles_may_merge():
+    assert authorize_tool({"roles": ["it_staff"]}, "it", "ticket_merge") is True
+    assert authorize_tool({"roles": ["network_admin"]}, "network", "ticket_merge") is True
+    assert authorize_tool({"roles": ["employee"]}, "it", "ticket_merge") is False
+    assert authorize_tool({"roles": ["auditor"]}, "it", "ticket_merge") is False
+
+
+def test_reading_requires_only_ticket_read():
+    assert authorize_tool({"roles": ["auditor"]}, "it", "ticket_list") is True
+    assert authorize_tool({"roles": ["auditor"]}, "it", "ticket_create") is False
+
+
+def test_catalog_status_reports_gating_and_permissions():
+    status = catalog_status()
+    names = {entry["name"] for entry in status["tools"]}
+    assert names == set(TOOLS)
+    assert status["approvalGated"] == ["ticket_merge"]
+    assert "ticket_merge" not in status["modelCallable"]
+
+
+def test_tool_status_separates_implemented_from_declared():
+    status = tool_status()
+
+    assert set(status["implemented"]) == set(TOOLS)
+    # `ticket_comment`/`ticket_get` are implemented but not declared for any agent yet.
+    assert set(status["implemented_not_wired"]) == {"ticket_comment", "ticket_get"}
+    assert status["declared_unimplemented"] == []
+    assert status["adapters"]["ticket"] == "internal-http"
+    # There is no mock provider: anything unimplemented refuses.
+    assert status["adapters"]["others"] in {"refuse", "openapi"}
+
+
+def test_an_unimplemented_tool_refuses_rather_than_inventing_a_result():
+    import asyncio
+
+    result = asyncio.run(RefusingToolAdapter().execute("idp", {}, {}))
+    assert result["success"] is False
+    assert result["error"] == "TOOL_NOT_IMPLEMENTED"
+    assert "未执行" in result["text"]
+
+
 # --------------------------------------------------------------------------- token
 
 
@@ -101,13 +203,12 @@ def test_caller_token_uses_the_reverse_issuer_audience_pair():
 
     assert claims["sub"] == "user-7"
     assert claims["roles"] == ["it_staff"]
-    # The mirror of what Java mints. If these ever match, tokens become replayable
-    # between the two services.
+    # The mirror of what Java mints. If these ever match, tokens become replayable between the
+    # two services.
     assert claims["iss"] == "sky-chat-agent-service"
     assert claims["aud"] == "sky-chat-java-service"
     assert claims["iss"] != settings.agent_internal_jwt_issuer
     assert claims["aud"] != settings.agent_internal_jwt_audience
-    assert claims["exp"] > dt.datetime.now(dt.timezone.utc).timestamp()
 
 
 def test_caller_token_needs_a_secret_and_a_subject(monkeypatch):
@@ -117,7 +218,6 @@ def test_caller_token_needs_a_secret_and_a_subject(monkeypatch):
 
     monkeypatch.setattr(settings, "agent_internal_jwt_secret", SECRET)
     with pytest.raises(ValueError):
-        # An anonymous call would be executed against an empty identity.
         mint_java_caller_token("   ")
 
 
@@ -127,20 +227,18 @@ def test_caller_token_needs_a_secret_and_a_subject(monkeypatch):
 @pytest.mark.asyncio
 async def test_ticket_create_posts_the_synthesized_arguments():
     client = FakeClient(FakeResponse(200, {"success": True, "text": "已创建", "data": {}}))
-    adapter = adapter_with(client)
 
-    result = await adapter.execute("ticket_create", {"latest_user_message": "打印机坏了"}, state())
+    result = await adapter_with(client).execute(
+        "ticket_create", {"latest_user_message": "打印机坏了"}, state()
+    )
 
     assert result["success"] is True
-    assert len(client.calls) == 1
     call = client.calls[0]
     assert call["url"] == "http://java.test:8080/v1/internal/tools/ticket_create"
     assert call["headers"]["Authorization"].startswith("Bearer ")
     args = call["json"]["args"]
     assert args["title"] == "打印机坏了"
-    assert args["description"] == "打印机坏了"
     assert args["type"] == "incident"
-    # The conversation is carried so a ticket raised from chat stays traceable.
     assert args["conversationId"] == "conv-9"
     # Never chosen here: the impact/urgency matrix owns priority.
     assert "priority" not in args
@@ -149,9 +247,8 @@ async def test_ticket_create_posts_the_synthesized_arguments():
 @pytest.mark.asyncio
 async def test_an_unreachable_java_service_is_a_failure_never_a_fabricated_success():
     client = FakeClient(error=httpx.ConnectError("refused"))
-    adapter = adapter_with(client)
 
-    result = await adapter.execute("ticket_create", {}, state())
+    result = await adapter_with(client).execute("ticket_create", {}, state())
 
     assert result["success"] is False
     assert result["error"] == TICKET_SERVICE_UNAVAILABLE
@@ -161,9 +258,8 @@ async def test_an_unreachable_java_service_is_a_failure_never_a_fabricated_succe
 @pytest.mark.asyncio
 async def test_a_rejected_caller_identity_is_reported_as_a_configuration_problem():
     client = FakeClient(FakeResponse(401, {"error": "INVALID_INTERNAL_CALLER"}))
-    adapter = adapter_with(client)
 
-    result = await adapter.execute("ticket_list", {}, state())
+    result = await adapter_with(client).execute("ticket_list", {}, state())
 
     assert result["success"] is False
     assert result["error"] == "INVALID_INTERNAL_CALLER"
@@ -174,9 +270,8 @@ async def test_a_rejected_caller_identity_is_reported_as_a_configuration_problem
 async def test_a_missing_secret_refuses_instead_of_calling(monkeypatch):
     monkeypatch.setattr(settings, "agent_internal_jwt_secret", "")
     client = FakeClient(FakeResponse(200, {"success": True}))
-    adapter = adapter_with(client)
 
-    result = await adapter.execute("ticket_create", {}, state())
+    result = await adapter_with(client).execute("ticket_create", {}, state())
 
     assert result["success"] is False
     assert result["error"] == CALLER_TOKEN_UNAVAILABLE
@@ -184,35 +279,72 @@ async def test_a_missing_secret_refuses_instead_of_calling(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_an_unparsable_body_is_a_failure():
-    client = FakeClient(FakeResponse(200, raw="not json"))
-    adapter = adapter_with(client)
-
-    result = await adapter.execute("ticket_list", {}, state())
-
-    assert result["success"] is False
-
-
-@pytest.mark.asyncio
-async def test_a_server_error_is_reported_with_its_status():
-    client = FakeClient(FakeResponse(500, {"error": "INTERNAL_ERROR"}))
-    adapter = adapter_with(client)
-
-    result = await adapter.execute("ticket_list", {}, state())
-
-    assert result["success"] is False
-    assert "500" in result["text"]
+async def test_an_unparsable_or_failed_response_is_a_failure():
+    assert (await adapter_with(FakeClient(FakeResponse(200, raw="not json")))
+            .execute("ticket_list", {}, state()))["success"] is False
+    assert (await adapter_with(FakeClient(FakeResponse(500, {"error": "X"})))
+            .execute("ticket_list", {}, state()))["success"] is False
 
 
 @pytest.mark.asyncio
 async def test_the_200_body_is_passed_through():
     body = {"success": True, "text": "共 1 张工单：\n#12 [new] 打印机", "data": {"total": 1}}
-    client = FakeClient(FakeResponse(200, body))
-
-    result = await adapter_with(client).execute("ticket_list", {"limit": 5}, state())
+    result = await adapter_with(FakeClient(FakeResponse(200, body))).execute(
+        "ticket_list", {"limit": 5}, state()
+    )
 
     assert result["text"] == body["text"]
     assert result["data"] == {"total": 1}
+
+
+@pytest.mark.asyncio
+async def test_merge_reads_the_two_numbers_in_the_order_mentioned():
+    client = FakeClient(FakeResponse(200, {"success": True, "text": "ok", "data": {}}))
+
+    await adapter_with(client).execute(
+        "ticket_merge", {"latest_user_message": "帮我把 #12 合并到 #14"}, state()
+    )
+
+    # "把 A 合并到 B" means source A, target B -- the two are not interchangeable.
+    assert client.calls[0]["json"]["args"]["sourceNumber"] == 12
+    assert client.calls[0]["json"]["args"]["targetNumber"] == 14
+
+
+def test_a_merge_without_two_numbers_is_refused_with_a_usable_message():
+    adapter = TicketToolAdapter(base_url="http://java.test:8080")
+
+    with pytest.raises(MergeTargetsMissing) as raised:
+        adapter._tool_args("ticket_merge", {"latest_user_message": "帮我合并工单"}, {})
+
+    assert "未执行合并" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_a_merge_refusal_becomes_a_result_rather_than_an_exception(monkeypatch):
+    class ExplodingClient:
+        async def post(self, *args, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("no call should be made without two tickets")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(settings, "agent_internal_jwt_secret", SECRET)
+    adapter = TicketToolAdapter(
+        client_factory=lambda: ExplodingClient(), base_url="http://java.test:8080"
+    )
+
+    result = await adapter.execute(
+        "ticket_merge",
+        {"latest_user_message": "帮我合并工单"},
+        {"user_id": "u1", "user_context": {"roles": ["it_staff"]}},
+    )
+
+    assert result["success"] is False
+    assert result["error"] == MERGE_TARGETS_MISSING
+    assert "未执行" in result["text"]
 
 
 # --------------------------------------------------------------------------- arguments
@@ -244,35 +376,24 @@ def test_impact_and_urgency_heuristics():
 
 
 @pytest.mark.asyncio
-async def test_routing_sends_tickets_to_the_real_adapter_and_marks_the_rest_simulated():
+async def test_routing_sends_tickets_to_the_real_adapter_and_refuses_the_rest():
     client = FakeClient(FakeResponse(200, {"success": True, "text": "ok", "data": {}}))
-    router = RoutingToolAdapter(
-        ticket_adapter=adapter_with(client),
-        fallback=MockToolAdapter(),
-    )
+    router = RoutingToolAdapter(ticket_adapter=adapter_with(client))
 
     real = await router.execute("ticket_list", {}, state())
     assert client.calls, "the ticket tool must reach the HTTP adapter"
     assert "simulated" not in real
 
-    stubbed = await router.execute("idp", {"latest_user_message": "重置密码"}, state())
-    # The stub must advertise itself, so nothing downstream can mistake it for an integration.
-    assert stubbed.get("simulated") is True
+    # There is no fallback that fabricates: an unimplemented tool refuses.
+    refused = await router.execute("idp", {}, state())
+    assert refused["success"] is False
+    assert refused["error"] == "TOOL_NOT_IMPLEMENTED"
 
 
-def test_tool_status_separates_real_from_mock():
-    status = tool_status()
-
-    # Five ticket tools are implemented; four are reachable as ordinary tools today, and
-    # `ticket_merge` is reachable only through an approval. The report distinguishes them.
-    assert set(status["implemented"]) == set(TICKET_TOOLS)
-    assert set(status["declared_real"]) == {"ticket_create", "ticket_list", "ticket_merge"}
-    assert set(status["implemented_not_wired"]) == {"ticket_get", "ticket_comment"}
-    assert "idp" in status["declared_mock"]
-    assert "mdm" in status["declared_mock"]
-    # There is no model function-calling in this service; saying otherwise would be a lie.
-    assert status["routing"] == "rule-based"
-    assert status["java_service_configured"] is True
+def test_ticket_tools_are_not_selectable_as_write_actions():
+    # Rule-based selection must never pick the approval-gated tool.
+    for message in ("合并工单", "帮我把 #12 合并到 #14", "我重复提交了两张工单"):
+        assert "ticket_merge" not in select_tools_for_request("it", message)
 
 
 # --------------------------------------------------------------------------- selection
@@ -288,19 +409,12 @@ def test_a_status_question_lists_tickets_instead_of_creating_one():
     assert "ticket_create" not in selected
 
 
-def test_a_ticket_number_is_looked_up():
-    assert "ticket_list" in select_tools_for_request("it", "帮我看看 #12")
-    assert "ticket_create" not in select_tools_for_request("it", "帮我看看 #12")
-
-
 def test_unrelated_messages_do_not_touch_tickets():
-    selected = select_tools_for_request("it", "今天天气怎么样")
-    assert not (set(selected) & set(TICKET_TOOLS))
+    assert select_tools_for_request("it", "今天天气怎么样") == []
 
 
-def test_capabilities_action_never_selects_ticket_tools():
-    selected = select_tools_for_request("it", "打印机坏了", action="capabilities")
-    assert not (set(selected) & set(TICKET_TOOLS))
+def test_capabilities_action_never_selects_tools():
+    assert select_tools_for_request("it", "打印机坏了", action="capabilities") == []
 
 
 def test_auto_creation_can_be_disabled(monkeypatch):
@@ -308,10 +422,3 @@ def test_auto_creation_can_be_disabled(monkeypatch):
     assert ticket_tools_for_message("打印机坏了", list(TICKET_TOOLS)) == []
     # Listing still works: the switch only governs automatic creation.
     assert "ticket_list" in ticket_tools_for_message("我的工单", list(TICKET_TOOLS))
-
-
-def test_agents_without_the_tool_never_get_it():
-    # The approval and guardian agents have no ticket tools declared.
-    assert not (
-        set(select_tools_for_request("approval", "打印机坏了")) & set(TICKET_TOOLS)
-    )

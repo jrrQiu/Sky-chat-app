@@ -56,7 +56,7 @@ def test_readiness_reports_no_system_executed_action():
 
 def test_the_write_actions_are_not_reachable_from_the_normal_tool_path():
     """An approved action must not also be selectable as an ordinary tool."""
-    from app.tools.adapters.mock import TOOLS_BY_AGENT, select_tools_for_request
+    from app.tools.selection import TOOLS_BY_AGENT, select_tools_for_request
 
     for agent, tools in TOOLS_BY_AGENT.items():
         assert "ticket_merge" not in tools, agent

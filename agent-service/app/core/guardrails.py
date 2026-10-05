@@ -82,20 +82,18 @@ ALLOWED_TOOL_ARG_KEYS = frozenset(
 #: Structured arguments a first-party tool legitimately accepts, beyond the common
 #: correlation keys above.
 #:
-#: The rail exists so *the model* cannot invent arguments, so a tool with a defined schema
-#: declares that schema here. Widening the shared set instead would have loosened every other
-#: tool at the same time, which is the opposite of what a rail is for.
-TOOL_ARG_KEYS_EXTRA: dict[str, frozenset[str]] = {
-    "ticket_create": frozenset(
-        {"type", "title", "description", "conversationId", "impact", "urgency"}
-    ),
-    "ticket_get": frozenset({"ticketId", "number"}),
-    "ticket_list": frozenset({"status", "type", "limit"}),
-    "ticket_comment": frozenset({"ticketId", "number", "body", "visibility"}),
-    "ticket_merge": frozenset(
-        {"sourceTicketId", "targetTicketId", "sourceNumber", "targetNumber"}
-    ),
-}
+#: Derived from the tool catalog so a tool's schema, its permission and this allow-list cannot
+#: drift apart. They did drift once: `ticket_merge` shipped with arguments the rail rejected, so
+#: the approved action would have been blocked by its own safety rail. The rail still exists for
+#: its original purpose -- *the model* must not be able to invent arguments -- and widening the
+#: shared set instead would have loosened every other tool at the same time.
+def _declared_arg_keys() -> dict[str, frozenset[str]]:
+    from app.tools.catalog import TOOLS
+
+    return {name: frozenset(spec.parameters) for name, spec in TOOLS.items()}
+
+
+TOOL_ARG_KEYS_EXTRA: dict[str, frozenset[str]] = _declared_arg_keys()
 
 
 def allowed_arg_keys(tool_name: str) -> frozenset[str]:

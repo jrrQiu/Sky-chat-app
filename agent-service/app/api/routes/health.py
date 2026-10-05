@@ -6,7 +6,7 @@ from app.knowledge.ingest import index_cache_state
 from app.intent.semantic import semantic_classifier_status
 from app.observability.tracing import observability_status
 from app.tools.actions import action_status
-from app.tools.adapters import tool_status
+from app.tools.adapters import catalog_status, routing_status, tool_status
 from app.retrieval.embedding import describe_dense_channel
 
 router = APIRouter()
@@ -51,8 +51,9 @@ async def ready(request: Request):
         # see rather than infer from a stale design document.
         "intent_semantic": semantic_classifier_status(),
         # Which tools are integrations and which are still placeholders, so nobody has to read
-        # the source to find out that IdP/MDM/HRIS/ERP are stubs.
-        "tools": tool_status(),
+        # the source to find out. `routing` says whether the model or the rules chose the tools,
+        # because claiming model-driven tool use when the fallback is running would be a lie.
+        "tools": {**tool_status(), "routing": routing_status(), "catalog": catalog_status()},
         # Which approved high-risk actions can actually reach a target system. Today none can:
         # the approval is real, the execution is not, and an operator should see that here
         # rather than after a user reports that their VPN still does not work.

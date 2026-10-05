@@ -1,68 +1,91 @@
+"""Tool adapters and the routing between them.
+
+The mock provider is gone. It used to answer twenty-odd tools with hardcoded strings, and every
+one of those answers read like a successful integration. Now a tool that has no adapter simply
+cannot be called: an unknown tool resolves to a refusal, which the caller reports honestly. A
+result can therefore no longer claim something happened when nothing did.
+"""
+
 from typing import Any
 
 import httpx
 
 from app.config import settings
+from app.registry.registry import list_agents
 from app.tools.adapters.contract import ToolAdapter
-from app.tools.adapters.mock import execute_mock_tool
 from app.tools.adapters.ticket import TICKET_TOOLS, TicketToolAdapter
+from app.tools.catalog import TOOLS
 
 
-class MockToolAdapter(ToolAdapter):
+class RefusingToolAdapter(ToolAdapter):
+    """The answer for a tool with no implementation: refuse, and say nothing was done."""
+
     async def execute(
         self,
         tool_name: str,
         args: dict[str, Any],
         state: dict[str, Any],
     ) -> dict[str, Any]:
-        return await execute_mock_tool(tool_name, args, state)
+        return {
+            "success": False,
+            "text": f"工具 {tool_name} 尚未实现，未执行任何操作。",
+            "error": "TOOL_NOT_IMPLEMENTED",
+        }
 
 
 class OpenApiToolAdapter(ToolAdapter):
+    """POSTs ``{tool_base_url}/{tool_name}`` and expects ``{success, text, ...}``.
+
+    Kept for the day a real third-party system is integrated, and **unused** until then:
+    ``tool_provider`` defaults to ``openapi`` only when a base URL is configured, and nothing is
+    configured. It is plumbing, not an integration.
+    """
+
     async def execute(
         self,
         tool_name: str,
         args: dict[str, Any],
         state: dict[str, Any],
     ) -> dict[str, Any]:
+        if not settings.tool_base_url:
+            return await RefusingToolAdapter().execute(tool_name, args, state)
+
         headers = {
+            "X-User-ID": str(state.get("user_id") or ""),
+            "Idempotency-Key": str(args.get("idempotency_key") or ""),
             "Content-Type": "application/json",
-            "X-User-ID": str(state.get("user_id", "")),
         }
         if settings.tool_api_token:
             headers["Authorization"] = f"Bearer {settings.tool_api_token}"
 
-        # Forward the ledger key so the provider can deduplicate a replayed call.
-        idempotency_key = args.get("idempotency_key")
-        if idempotency_key:
-            headers["Idempotency-Key"] = str(idempotency_key)
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"{settings.tool_base_url.rstrip('/')}/{tool_name}",
-                headers=headers,
-                json={"args": args, "state": state},
-            )
-            response.raise_for_status()
+        url = f"{settings.tool_base_url.rstrip('/')}/{tool_name}"
+        try:
+            async with httpx.AsyncClient(timeout=settings.tool_timeout_seconds) as client:
+                response = await client.post(url, headers=headers, json={"args": args, "state": state})
+        except httpx.HTTPError as error:
+            return {
+                "success": False,
+                "text": f"目标系统不可用（{type(error).__name__}），该操作未执行",
+                "error": "TOOL_PROVIDER_UNAVAILABLE",
+            }
+        if response.status_code >= 400:
+            return {
+                "success": False,
+                "text": f"目标系统返回 {response.status_code}，该操作未执行",
+                "error": "TOOL_PROVIDER_ERROR",
+            }
+        try:
             body = response.json()
-            if not isinstance(body, dict):
-                return {"success": True, "text": str(body)}
-            return body
-
-
-def get_tool_adapter() -> ToolAdapter:
-    """The adapter the graph uses.
-
-    Returns a router rather than a single adapter, because the tool set is mixed:
-    the ticket tools call the Java service for real while the rest are still stubs.
-    Routing here (instead of at every call site) keeps that split in one place and
-    lets :func:`tool_status` report it.
-    """
-    return RoutingToolAdapter()
+        except ValueError:
+            return {"success": False, "text": "目标系统返回了无法解析的响应", "error": "TOOL_PROVIDER_ERROR"}
+        if not isinstance(body, dict):
+            return {"success": False, "text": "目标系统返回了非预期结构", "error": "TOOL_PROVIDER_ERROR"}
+        body.setdefault("success", False)
+        return body
 
 
 class RoutingToolAdapter(ToolAdapter):
-    """Dispatches each tool to the adapter that actually implements it."""
+    """Dispatches each tool to the adapter that implements it."""
 
     def __init__(
         self,
@@ -70,7 +93,11 @@ class RoutingToolAdapter(ToolAdapter):
         fallback: ToolAdapter | None = None,
     ) -> None:
         self._ticket = ticket_adapter or TicketToolAdapter()
-        self._fallback = fallback or MockToolAdapter()
+        self._fallback = fallback or (
+            OpenApiToolAdapter()
+            if settings.tool_provider == "openapi" and settings.tool_base_url
+            else RefusingToolAdapter()
+        )
 
     async def execute(
         self,
@@ -80,57 +107,38 @@ class RoutingToolAdapter(ToolAdapter):
     ) -> dict[str, Any]:
         if tool_name in TICKET_TOOLS:
             return await self._ticket.execute(tool_name, args, state)
-        result = await self._fallback.execute(tool_name, args, state)
-        # Mark stub output as simulated so nothing downstream can mistake it for a real
-        # integration. Every non-ticket tool is still a stub today.
-        if isinstance(result, dict):
-            return {**result, "simulated": True}
-        return result
+        return await self._fallback.execute(tool_name, args, state)
 
 
-def tool_provider(tool_name: str) -> str:
-    return "real" if tool_name in TICKET_TOOLS else "mock"
+def get_tool_adapter() -> ToolAdapter:
+    return RoutingToolAdapter()
 
 
 def tool_status() -> dict[str, Any]:
     """Per-tool truthfulness report for the readiness payload.
 
-    An operator should be able to see which capabilities are integrations and which
-    are placeholders without reading the source. Three sets matter and they are not
-    the same thing:
-
-    ``implemented``
-        an adapter exists that talks to a real system;
-    ``declared_mock``
-        the registry offers the tool to an agent, but the adapter is a stub;
-    ``implemented_not_wired``
-        an adapter exists but no agent can reach it yet, so it is capability we own
-        and have not exposed.
+    ``implemented`` is the catalog; ``declared`` is what the registry offers to an agent. A tool
+    can be declared but not implemented (it will refuse), and implemented but not declared (it is
+    capability we own and have not exposed) -- two different things, both worth seeing.
     """
-    from app.registry.registry import list_agents
-
     declared: list[str] = []
     for agent in list_agents():
         for name in agent.get("tools", []):
             if name not in declared:
                 declared.append(name)
 
-    implemented = sorted(TICKET_TOOLS)
-    declared_real = sorted(name for name in declared if name in TICKET_TOOLS)
-    declared_mock = sorted(name for name in declared if name not in TICKET_TOOLS)
-    not_wired = sorted(name for name in TICKET_TOOLS if name not in declared)
-
+    implemented = sorted(TOOLS)
+    openapi = bool(settings.tool_provider == "openapi" and settings.tool_base_url)
     return {
         "implemented": implemented,
-        "declared_real": declared_real,
-        "declared_mock": declared_mock,
-        "implemented_not_wired": not_wired,
-        "counts": {
-            "implemented": len(implemented),
-            "declared_real": len(declared_real),
-            "declared_mock": len(declared_mock),
+        "declared": sorted(declared),
+        "declared_unimplemented": sorted(n for n in declared if n not in TOOLS),
+        "implemented_not_wired": sorted(n for n in implemented if n not in declared),
+        "counts": {"implemented": len(implemented), "declared": len(declared)},
+        # There is no mock provider any more: an unimplemented tool refuses rather than
+        # pretending. This says which adapter serves the implemented ones.
+        "adapters": {
+            "ticket": "internal-http",
+            "others": "openapi" if openapi else "refuse",
         },
-        # No model function-calling: tools are chosen by rules over the user message.
-        "routing": "rule-based",
-        "java_service_configured": bool(settings.java_service_base_url),
     }

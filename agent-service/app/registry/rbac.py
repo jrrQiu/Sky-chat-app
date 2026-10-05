@@ -3,71 +3,67 @@ from typing import Any
 from app.registry.registry import get_agent
 
 
+#: What each role may do.
+#:
+#: `service:request` gates *access to the service-desk agents* (it replaced the per-domain
+#: permissions that only existed to gate the deleted stub tools). Everything that changes state
+#: is still gated individually below, so being able to talk to the IT agent does not mean being
+#: able to merge tickets.
 ROLE_PERMISSIONS: dict[str, set[str]] = {
     "employee": {
         "knowledge:read",
-        # Anyone may raise and follow up their own ticket. Which tickets they can
-        # actually see is decided by the Java service, not by this permission.
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
     },
     "it_user": {
-        "it:password_reset",
-        "it:device:read",
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
     },
     "it_staff": {
-        "it:password_reset",
-        "it:device:read",
-        "it:software:install",
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
         "ticket:merge",
     },
     "network_user": {
-        "network:vpn:read",
-        "network:access:read",
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
     },
     "network_admin": {
-        "network:vpn:read",
-        "network:vpn:create",
-        "network:access:read",
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
         "ticket:merge",
     },
     "hr_user": {
-        "hr:leave:read",
-        "hr:onboarding:read",
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
     },
     "hr_staff": {
-        "hr:profile:read",
-        "hr:leave:read",
-        "hr:onboarding:read",
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
         "ticket:merge",
     },
     "finance_user": {
-        "finance:invoice:read",
-        "finance:budget:read",
+        "service:request",
         "ticket:read",
         "ticket:create",
         "ticket:comment",
     },
     "approver": {
+        "service:request",
         "approval:read",
         "approval:create",
         "ticket:read",
@@ -75,50 +71,25 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "ticket:comment",
     },
     "auditor": {
-        "knowledge:read",
-        "audit:write",
-        "policy:enforce",
         # Read-only oversight: may look, may not raise or reply through the agent.
+        "knowledge:read",
         "ticket:read",
     },
 }
 
 
-TOOL_PERMISSIONS: dict[str, set[str]] = {
-    "ticket_create": {"ticket:create"},
-    "ticket_comment": {"ticket:comment"},
-    "ticket_get": {"ticket:read"},
-    "ticket_list": {"ticket:read"},
-    # Merging is destructive (the source becomes a tombstone), so it is staff-only and gated
-    # behind an approval on top of that.
-    "ticket_merge": {"ticket:merge"},
-    "agent_registry": {"agent:select"},
-    "policy_api": {"run:read"},
-    "idp": {"it:password_reset"},
-    "mdm": {"it:device:read"},
-    "software_center": {"it:software:install"},
-    "vpn_api": {"network:vpn:create"},
-    "vpn_api_provision": {"network:vpn:create"},
-    "cmdb": {"network:access:read"},
-    "permission_system": {"network:access:read"},
-    "hris": {"hr:profile:read", "hr:leave:read"},
-    "organization_service": {"hr:profile:read"},
-    "form_service": {"hr:onboarding:read"},
-    "erp": {"finance:invoice:read"},
-    "ocr": {"finance:invoice:read"},
-    "budget_service": {"finance:budget:read"},
-    "pgvector": {"knowledge:read"},
-    "elasticsearch": {"knowledge:read"},
-    "reranker": {"knowledge:read"},
-    "rule_engine": {"approval:read"},
-    "temporal": {"approval:create"},
-    "notification_system": {"approval:read"},
-    "approval_decision": {"approval:create"},
-    "finance_submit": {"finance:invoice:read"},
-    "rbac": {"policy:enforce"},
-    "dlp": {"policy:enforce"},
-    "audit_service": {"audit:write"},
-}
+def _tool_permissions() -> dict[str, set[str]]:
+    """Derived from the catalog, so a tool and its permission cannot drift apart."""
+    from app.tools.catalog import TOOLS
+
+    return {
+        name: {spec.permission}
+        for name, spec in TOOLS.items()
+        if spec.permission
+    }
+
+
+TOOL_PERMISSIONS: dict[str, set[str]] = _tool_permissions()
 
 
 def all_permissions() -> set[str]:
@@ -128,7 +99,8 @@ def all_permissions() -> set[str]:
 def granted_permissions(user_context: dict[str, Any] | None) -> set[str]:
     roles = set((user_context or {}).get("roles", []))
     if "admin" in roles:
-        return all_permissions()
+        tool_permissions = {p for perms in TOOL_PERMISSIONS.values() for p in perms}
+        return all_permissions() | tool_permissions
 
     if not roles:
         return {"knowledge:read"}
@@ -163,5 +135,6 @@ def authorize_tool(
 ) -> bool:
     required = TOOL_PERMISSIONS.get(tool_name)
     if required is None:
+        # Not a catalogued tool: fall back to the agent-level gate rather than allowing it.
         required = set(get_agent(agent_id).get("permissions", []))
     return has_any_permission(user_context, required)

@@ -50,7 +50,7 @@ from app.tools.actions import (
     refusal_message,
     resolve,
 )
-from app.tools.adapters.mock import execute_mock_tool, implemented_write_refusal
+from app.tools.adapters.base import RefusingToolAdapter
 
 #: A system-executed action declared only for the tests, standing in for a real third-party
 #: integration until one exists.
@@ -112,7 +112,8 @@ class RecordingAdapter:
             if self.merge_error is not None:
                 raise self.merge_error
             return self.merge_result
-        return implemented_write_refusal(tool_name)
+        # No mock provider exists any more: anything unimplemented refuses.
+        return await RefusingToolAdapter().execute(tool_name, args, state)
 
     def names(self) -> list[str]:
         return [name for name, _ in self.calls]
@@ -556,20 +557,24 @@ async def test_an_approved_request_with_nothing_to_execute_is_still_registered(w
 def test_the_synthetic_actions_are_not_in_any_agent_tool_list():
     # The production containment assertion (that ticket_merge is not selectable) lives in
     # test_action_registry.py; this one covers the test-only actions.
-    from app.tools.adapters.mock import TOOLS_BY_AGENT
+    from app.tools.selection import TOOLS_BY_AGENT
 
     for agent, tools in TOOLS_BY_AGENT.items():
         assert SYSTEM_ACTION not in tools, agent
         assert PENDING_ACTION not in tools, agent
 
 
-def test_the_legacy_write_names_can_no_longer_fabricate_success():
+def test_the_deleted_write_names_no_longer_exist_anywhere():
     import asyncio
 
-    for name in ("vpn_api_provision", "finance_submit", "approval_decision"):
-        result = asyncio.run(execute_mock_tool(name, {}, {"intent": "network.vpn.request"}))
+    from app.tools.actions import ACTIONS
+
+    # The actions themselves are gone (test_action_registry.py asserts the registry contents);
+    # and the retired tool names cannot be called either, because no adapter implements them.
+    for name in ("vpn_api_provision", "finance_submit", "approval_decision", "idp", "erp"):
+        assert name not in ACTIONS
+        result = asyncio.run(RefusingToolAdapter().execute(name, {}, {}))
         assert result["success"] is False
-        assert result["error"] == "ACTION_NOT_IMPLEMENTED"
         assert "未执行" in result["text"]
 
 

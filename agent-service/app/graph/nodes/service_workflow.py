@@ -107,12 +107,15 @@ async def prepare_read_only_tools(
 ):
     emit = _emit(config)
     selected_agent = str(state.get("selected_agent", "knowledge"))
+    # Read-only tools for the high-risk path. This used to list stubs (`idp`, `cmdb`, `erp`,
+    # `hris`) that returned canned text; the only real read-only tool is the ticket lookup.
     read_only_by_agent = {
-        "network": ["cmdb", "permission_system"],
-        "finance": ["erp"],
-        "hr": ["hris"],
-        "it": ["idp"],
+        "network": ["ticket_list"],
+        "finance": ["ticket_list"],
+        "hr": ["ticket_list"],
+        "it": ["ticket_list"],
         "approval": [],
+        "knowledge": ["ticket_list"],
     }
     tool_names = read_only_by_agent.get(selected_agent, [])
     adapter = get_tool_adapter()

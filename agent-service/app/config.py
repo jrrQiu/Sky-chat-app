@@ -72,13 +72,20 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
     stream_idle_timeout_seconds: float = 30.0
 
-    tool_provider: str = "mock"
+    # Which adapter serves tools the ticket adapter does not implement. `openapi` POSTs to
+    # `tool_base_url`; anything else refuses, because the mock provider that used to answer here
+    # was deleted -- it returned hardcoded strings that read like successful integrations.
+    tool_provider: str = "internal"
     tool_base_url: str = ""
     tool_api_token: str = ""
     # Whether a problem described in chat automatically raises a real ticket. On by
     # default because that is the point of a service desk, but an operator can turn
     # it off without losing the ticket tools themselves.
     ticket_auto_create_from_chat: bool = True
+    # Whether the model chooses tools (function calling) instead of the rule-based
+    # fallback. Requires a model API key; `/ready` reports which mode is actually in
+    # effect under `tools.routing`, so the two are not confused.
+    function_calling_enabled: bool = True
     # When an approved high-risk action has no integrated target system, register the
     # approved work as a change ticket in our own system of record. The external action
     # still reports as not executed; this only ensures the approval leaves a trace.

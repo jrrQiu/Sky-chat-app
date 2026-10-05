@@ -1,97 +1,77 @@
 agents:
-  # NOTE ON TOOL HONESTY
-  # Only ticket_create / ticket_get / ticket_list / ticket_comment are implemented against a
-  # real system (the Java service). Every other tool name below is still a stub that returns
-  # canned text; the adapter marks those results `simulated: true` and `/ready` lists which is
-  # which under `tools.real` / `tools.mock`. Do not describe this deployment as integrated with
-  # IdP/MDM/HRIS/ERP until those adapters exist.
+  # NOTE ON TOOLS
+  # Only the tools in `app/tools/catalog.py` exist, and every one of them talks to a real
+  # system -- currently the Java service's ticket API. The IdP/MDM/HRIS/ERP tools were removed:
+  # they returned hardcoded strings ("账号和配置已开通", a fabricated `IT-IDP-10086`) and a model
+  # will call anything it is offered. `/ready` lists what is implemented, what is declared, and
+  # what is approval-gated.
   #
   # NOTE ON `permissions`
   # `authorize_agent` grants access when the user holds ANY of an agent's permissions, so these
-  # must stay specific to the agent (e.g. `network:*`). Adding a broadly-held permission such as
-  # `ticket:read` here would make the agent reachable by every role that holds it -- a widening
-  # that a unit test caught once already. Tool-level authorization belongs in
-  # `app/registry/rbac.py:TOOL_PERMISSIONS`, which is per-tool and needs no entry here.
+  # must stay specific to the agent. `service:request` gates access to the service-desk agents
+  # and is held by every authenticated role; `knowledge:read` gates the knowledge agent. Adding a
+  # broadly-held *tool* permission (e.g. `ticket:read`) here would make the agent reachable by
+  # everyone who holds it -- a widening a unit test caught once already, and the reason
+  # tool-level authorization lives in `catalog.py`/`rbac.py` instead.
   - id: orchestrator
     name: Orchestrator
     description: Classifies intent, assesses risk, and routes to specialist agents.
     model_hint: lightweight-classifier
     prompt_version: 1
     tools:
-      - agent_registry
-      - policy_api
       - ticket_list
     permissions:
-      - agent:select
-      - run:read
+      - service:request
 
   - id: it
     name: IT Agent
-    description: Handles password reset, software install, device issues, and unlocks.
-    model_hint: general-with-structured-output
-    prompt_version: 1
-    tools:
-      - idp
-      - mdm
-      - software_center
-      - ticket_create
-      - ticket_list
-      # Staff-only and destructive; reachable only through an approval, never selected as a
-      # normal tool (see the assertion in tests/test_write_actions.py).
-      - ticket_merge
-    permissions:
-      - it:password_reset
-      - it:device:read
-      - it:software:install
-
-  - id: network
-    name: Network Agent
-    description: Handles VPN, Wi-Fi, firewall, and internal system access.
+    description: Handles device and account problems and raises tickets for the service desk.
     model_hint: general-with-tool-calling
     prompt_version: 1
     tools:
-      - vpn_api
-      - cmdb
-      - permission_system
+      - ticket_create
+      - ticket_list
+      # Approval-gated and destructive: reachable only through the approval gate, never offered
+      # to the model (see `tools/catalog.py` and the assertion in tests/test_action_registry.py).
+      - ticket_merge
+    permissions:
+      - service:request
+
+  - id: network
+    name: Network Agent
+    description: Handles network and access problems and raises tickets for the service desk.
+    model_hint: general-with-tool-calling
+    prompt_version: 1
+    tools:
       - ticket_create
       - ticket_list
       - ticket_merge
     permissions:
-      - network:vpn:read
-      - network:vpn:create
-      - network:access:read
+      - service:request
 
   - id: hr
     name: HR Agent
-    description: Handles leave, onboarding, certificates, and employee data.
-    model_hint: general
+    description: Handles employee questions and raises tickets for the service desk.
+    model_hint: general-with-tool-calling
     prompt_version: 1
     tools:
-      - hris
-      - organization_service
-      - form_service
       - ticket_create
       - ticket_list
       - ticket_merge
     permissions:
-      - hr:profile:read
-      - hr:leave:read
-      - hr:onboarding:read
+      - service:request
 
   - id: finance
     name: Finance Agent
-    description: Handles reimbursement, invoices, budgets, purchases, and payments.
-    model_hint: general-with-ocr
+    description: Handles reimbursement and budget questions and raises tickets for the service desk.
+    model_hint: general-with-tool-calling
     prompt_version: 1
     tools:
-      - erp
-      - ocr
-      - budget_service
       - ticket_create
       - ticket_list
+      - ticket_merge
     permissions:
-      - finance:invoice:read
-      - finance:budget:read
+      - service:request
 
   - id: knowledge
     name: Knowledge Agent
@@ -99,9 +79,6 @@ agents:
     model_hint: embedding-reranker-general
     prompt_version: 1
     tools:
-      - pgvector
-      - elasticsearch
-      - reranker
       - ticket_list
     permissions:
       - knowledge:read
@@ -111,23 +88,19 @@ agents:
     description: Decides whether approval is required and manages approval tasks.
     model_hint: rules-first
     prompt_version: 1
-    tools:
-      - rule_engine
-      - temporal
-      - notification_system
+    # No tools: the approval flow is driven by the graph nodes and the approval store, not by a
+    # tool the model can call.
+    tools: []
     permissions:
       - approval:read
-      - approval:create
 
   - id: guardian
     name: Guardian Agent
     description: Checks permissions, sensitive data, prompt injection, and results.
     model_hint: rules-or-independent-model
     prompt_version: 1
-    tools:
-      - rbac
-      - dlp
-      - audit_service
+    # No tools: guarding happens in the `guardian_input`/`guardian_output` nodes and in
+    # `core/guardrails.py`, so an agent with tool access here would only widen the surface.
+    tools: []
     permissions:
-      - audit:write
-      - policy:enforce
+      - service:request

@@ -129,19 +129,20 @@ def _clean_pg_state(pg_env, monkeypatch):
 
 class CountingAdapter:
     def __init__(self) -> None:
-        from app.tools.adapters.mock import execute_mock_tool
+        from app.tools.adapters.base import RefusingToolAdapter
 
-        self._execute = execute_mock_tool
+        self._refuse = RefusingToolAdapter()
         self.calls: list[str] = []
 
     async def execute(self, tool_name, args, state):
         self.calls.append(tool_name)
         if tool_name == WRITE_ACTION:
             # This fixture declares the action integrated, so the double must behave like a
-            # reachable target system. The mock provider deliberately refuses this action now,
-            # which would make the ledger record "failed" and the assertion below meaningless.
-            return {"success": True, "text": "账号和配置已开通。", "data": {"provisioned": True}}
-        return await self._execute(tool_name, args, state)
+            # reachable target system.
+            return {"success": True, "text": "已合并。", "data": {"merged": True}}
+        # No mock provider exists any more: an unimplemented tool refuses rather than
+        # fabricating a result.
+        return await self._refuse.execute(tool_name, args, state)
 
 
 @pytest.fixture

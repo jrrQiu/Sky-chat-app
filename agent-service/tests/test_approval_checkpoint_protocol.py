@@ -35,7 +35,7 @@ from app.persistence.approval_store import (
 )
 from app.services.approval_resume import resolve_approval
 from app.services.resume_reconciler import reconcile_once
-from app.tools.adapters.mock import execute_mock_tool
+from app.tools.adapters.base import RefusingToolAdapter
 
 
 WRITE_ACTION = "ticket_merge"
@@ -88,19 +88,20 @@ def make_request(request_id: str, message: str = "帮我把 #12 合并到 #14") 
 
 
 class CountingAdapter:
-    """Records every tool invocation and delegates to the mock provider."""
+    """Records every tool invocation; refuses anything it does not implement."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self._refuse = RefusingToolAdapter()
 
     async def execute(self, tool_name, args, state):
         self.calls.append((tool_name, args))
         if tool_name == WRITE_ACTION:
             # The approved action is declared as integrated, so the double behaves like a
-            # reachable target system rather than falling through to the mock's unknown-tool
-            # refusal.
+            # reachable target system rather than refusing.
             return {"success": True, "text": "已执行。", "data": {"merged": True}}
-        return await execute_mock_tool(tool_name, args, state)
+        # No mock provider exists any more: an unimplemented tool refuses.
+        return await self._refuse.execute(tool_name, args, state)
 
     def names(self) -> list[str]:
         return [name for name, _ in self.calls]
