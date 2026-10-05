@@ -30,10 +30,28 @@ from app.core.internal_token import CallerTokenUnavailable, mint_java_caller_tok
 from app.tools.adapters.base import ToolAdapter
 
 #: Tools this adapter serves. Everything else still resolves to the mock adapter.
-TICKET_TOOLS = ("ticket_create", "ticket_get", "ticket_list", "ticket_comment")
+TICKET_TOOLS = (
+    "ticket_create",
+    "ticket_get",
+    "ticket_list",
+    "ticket_comment",
+    "ticket_merge",
+)
+
+#: Ticket numbers in a message ("#12", "工单 12"). Used for merges, where the user names two.
+_TICKET_NUMBER_PATTERN = re.compile(r"#\s*(\d+)|工单\s*(?:号|编号)?\s*(\d+)")
 
 TICKET_SERVICE_UNAVAILABLE = "TICKET_SERVICE_UNAVAILABLE"
 CALLER_TOKEN_UNAVAILABLE = "CALLER_TOKEN_UNAVAILABLE"
+MERGE_TARGETS_MISSING = "MERGE_TARGETS_MISSING"
+
+
+class MergeTargetsMissing(ValueError):
+    """The request did not name two tickets, so there is nothing to merge.
+
+    Raised while building the arguments and converted into a normal failure result: a request
+    the user can fix is not an exception, it is an answer.
+    """
 
 _MAX_TITLE = 120
 _MAX_DESCRIPTION = 2000
@@ -89,7 +107,10 @@ class TicketToolAdapter(ToolAdapter):
         except ValueError:
             return _failure("无法确定操作人身份，未执行该操作", CALLER_TOKEN_UNAVAILABLE)
 
-        body_args = self._tool_args(tool_name, args, state)
+        try:
+            body_args = self._tool_args(tool_name, args, state)
+        except MergeTargetsMissing as error:
+            return _failure(str(error), MERGE_TARGETS_MISSING)
         payload = {"args": body_args}
         url = f"{self.base_url}/v1/internal/tools/{tool_name}"
         headers = {
@@ -157,7 +178,38 @@ class TicketToolAdapter(ToolAdapter):
                 "body": args.get("body") or message,
                 "visibility": args.get("visibility") or "public",
             })
+        if tool_name == "ticket_merge":
+            return self._merge_args(args, message)
         return dict(args)
+
+    def _merge_args(self, args: dict[str, Any], message: str) -> dict[str, Any]:
+        """Which two tickets to merge.
+
+        The user names them in prose ("把 #12 合并到 #14"), and this service has no model
+        function-calling, so the numbers are read from the message. Explicit ids win when a
+        caller supplies them.
+        """
+        explicit = _without_none({
+            "sourceTicketId": args.get("sourceTicketId"),
+            "targetTicketId": args.get("targetTicketId"),
+            "sourceNumber": args.get("sourceNumber"),
+            "targetNumber": args.get("targetNumber"),
+        })
+        if "sourceTicketId" in explicit or "targetTicketId" in explicit:
+            return explicit
+
+        numbers = [
+            int(first or second)
+            for first, second in _TICKET_NUMBER_PATTERN.findall(message)
+        ]
+        if len(numbers) < 2:
+            # Refused locally with a usable message: sending a merge without both tickets would
+            # only make the target service repeat this.
+            raise MergeTargetsMissing(
+                "请提供要合并的两张工单编号，例如「把 #12 合并到 #14」。未执行合并。"
+            )
+        # Order is the order they were mentioned: "把 A 合并到 B" means source A, target B.
+        return {"sourceNumber": numbers[0], "targetNumber": numbers[1]}
 
     def _create_args(
         self,

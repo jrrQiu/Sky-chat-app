@@ -84,18 +84,37 @@ def _rule_candidates(text: str, context_text: str) -> list[dict[str, Any]]:
     return candidates
 
 
+_RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
 def _policy_risk(candidate: dict[str, Any]) -> str:
+    """The effective risk of a candidate: the policy floor, or stricter if the rule says so.
+
+    Policy is derived from (operation, domain) so that the shape of an action -- not the wording
+    of a hand-written pattern -- decides how much scrutiny it gets. A rule may **escalate** above
+    that floor, because some actions are dangerous regardless of the domain bucket they land in
+    (merging two tickets destroys one of them). It may not downgrade it: otherwise a careless
+    pattern could exempt its own action from approval, and the rule's `risk` field would be a
+    silent no-op -- which is what it had become.
+    """
     operation = candidate.get("operation")
     domain = candidate.get("domain")
     if operation == "approve":
-        return "high"
-    if operation == "submit":
+        policy = "high"
+    elif operation == "submit":
         if domain in {"network", "finance"}:
-            return "high"
-        if domain in {"it", "hr"}:
-            return "medium"
-        return candidate.get("risk", "high")
-    return "low"
+            policy = "high"
+        elif domain in {"it", "hr"}:
+            policy = "medium"
+        else:
+            policy = candidate.get("risk", "high")
+    else:
+        policy = "low"
+
+    declared = candidate.get("risk") or "low"
+    if _RISK_ORDER.get(declared, 0) > _RISK_ORDER.get(policy, 0):
+        return declared
+    return policy
 
 
 def _apply_policy(candidate: dict[str, Any]) -> dict[str, Any]:

@@ -18,7 +18,9 @@ from app.persistence.approval_store import (
 from app.registry.rbac import authorize_agent, authorize_tool
 from app.tools.actions import (
     ACTIONS,
+    APPROVAL_ACTION_MISMATCH,
     AUTHORITY_SYSTEM,
+    WriteAction,
     action_key,
     describe_outcome,
     evaluate_system_authority,
@@ -344,23 +346,151 @@ async def _system_authority(
     )
 
 
+def _write_args(state: dict[str, Any]) -> dict[str, Any]:
+    """The shared argument envelope a write action is invoked with."""
+    return {
+        "request_id": state.get("request_id"),
+        "user_id": state.get("user_id"),
+        "intent": state.get("intent"),
+        "risk_level": state.get("risk_level"),
+        "latest_user_message": state.get("latest_user_message"),
+    }
+
+
+async def _record_change_ticket(
+    state: dict[str, Any],
+    adapter: Any,
+    args: dict[str, Any],
+    *,
+    title: str,
+    description: str,
+) -> int | None:
+    """Register the approved work in the system we actually own.
+
+    This part is real: it creates a change ticket through the same Java endpoint a user-raised
+    ticket goes through, so an approval leaves an auditable trail even when the external call
+    cannot be made. It is not a substitute for the external action -- `describe_outcome` and the
+    no-action message both say so.
+    """
+    if not settings.high_risk_records_change_ticket:
+        return None
+    ticket_args = {**args, "type": "change", "title": title, "description": description}
+    # The ticket tool has its own declared argument schema, so this passes the execution rail
+    # while other tools still reject invented arguments.
+    if enforce_tool_rails("ticket_create", ticket_args, {}) is not None:
+        return None
+    result = await adapter.execute("ticket_create", ticket_args, state)
+    if not result.get("success"):
+        return None
+    number = (result.get("data") or {}).get("number")
+    return int(number) if isinstance(number, (int, float, str)) and str(number).isdigit() else None
+
+
+async def _approval_action(approval_id: str | None) -> str | None:
+    """The action the approval was created for -- i.e. what was actually approved."""
+    if not approval_id:
+        return None
+    try:
+        task = await approval_store.get(approval_id)
+    except Exception as exc:
+        # Not fatal on its own: for dual control the requester's own permission authorizes the
+        # action. It does mean the "does this match what was approved" check cannot run, so it is
+        # worth a warning rather than silence.
+        logger.warning("Could not read approval %s for its action: %s", approval_id, exc)
+        return None
+    if task is None:
+        return None
+    return str((task.resume_payload or {}).get("pending_action") or "") or None
+
+
 async def execute_approved_action(
     state: dict[str, Any],
     config: RunnableConfig | None = None,
 ):
     emit = _emit(config)
-    pending_action = str(state.get("pending_action", ""))
     turn_id = str(state.get("turn_id") or state.get("request_id", ""))
     selected_agent = str(state.get("selected_agent", "approval"))
     approval_id = str((state.get("approval") or {}).get("id") or "") or None
+
+    # The action to run is the one the **approval** was created for, not whatever the graph state
+    # happens to carry. The approval record is what was approved; a resume that trusted the state
+    # could execute a different action from the one a human signed off on.
+    pending_action = str(state.get("pending_action", ""))
+    approved_action = await _approval_action(approval_id)
+    if approved_action and pending_action and approved_action != pending_action:
+        message = refusal_message(
+            ACTIONS.get(approved_action)
+            or WriteAction(name=approved_action, description=approved_action),
+            APPROVAL_ACTION_MISMATCH,
+        )
+        await record_action(
+            "tool.write",
+            object_type="tool",
+            object_id=pending_action,
+            outcome="denied",
+            actor_id=str(state.get("user_id") or "") or None,
+            detail={
+                "turn_id": turn_id,
+                "approval_id": approval_id,
+                "reason": APPROVAL_ACTION_MISMATCH,
+                "approved_action": approved_action,
+                "requested_action": pending_action,
+                # What was authorized is the approved action, so that is what the audit attributes.
+                "executed_as": (
+                    "system"
+                    if (ACTIONS.get(approved_action) or WriteAction(name="", description="")).authority
+                    == AUTHORITY_SYSTEM
+                    else "requester"
+                ),
+                "external_executed": False,
+            },
+        )
+        if emit:
+            await emit({"type": "error", "message": message})
+        return {"status": "failed", "guard_error": APPROVAL_ACTION_MISMATCH, "final_answer": message}
+
+    pending_action = approved_action or pending_action
     requested_action = ACTIONS.get(pending_action)
 
     if requested_action is None:
-        # Nothing external to run. That is a real answer for an approval-decision request,
-        # and it is also what an intent with no wired-up action gets -- previously such
-        # requests were given the invented action name "approval_decision" and answered with
-        # a canned success string.
-        message = "审批已通过；该请求没有需要外部系统执行的动作。"
+        # No wired action. That is a real answer for an approval-decision request -- the
+        # approval *is* the outcome -- and it is also what an intent whose target system is not
+        # integrated gets. Previously such requests were given the invented action name
+        # "approval_decision" and answered with a canned success string.
+        #
+        # The request is still registered in the system we own, so an approved request is never
+        # simply forgotten just because we cannot execute it.
+        ticket_number = await _record_change_ticket(
+            state,
+            get_tool_adapter(),
+            _write_args(state),
+            title=f"[人工跟进] {state.get('intent') or '未分类请求'}",
+            description=(
+                f"审批已通过，但该请求对应的目标系统尚未接入，无法自动执行。\n"
+                f"审批单：{approval_id or '未记录'}\n意图：{state.get('intent')}\n"
+                f"原始请求：{state.get('latest_user_message')}"
+            ),
+        )
+        message = "审批已通过；该请求没有已接入的外部执行动作。"
+        message += (
+            f"已登记变更单 #{ticket_number} 交由人工跟进。"
+            if ticket_number
+            else "未能登记变更单，请人工核对。"
+        )
+        await record_action(
+            "tool.write",
+            object_type="tool",
+            object_id=pending_action or "no-action",
+            outcome="success" if ticket_number else "failure",
+            actor_id=str(state.get("user_id") or "") or None,
+            detail={
+                "turn_id": turn_id,
+                "approval_id": approval_id,
+                "reason": "NO_WIRED_ACTION",
+                "change_ticket_number": ticket_number,
+                "external_executed": False,
+            },
+        )
         if emit:
             await emit(
                 {
@@ -377,6 +507,7 @@ async def execute_approved_action(
                     "toolName": pending_action or "no-action",
                     "success": True,
                     "noActionRequired": True,
+                    "changeTicketNumber": ticket_number,
                     "text": message,
                 }
             ],
@@ -447,13 +578,7 @@ async def execute_approved_action(
 
     adapter = get_tool_adapter()
     tool_call_id = f"write_{uuid.uuid4().hex[:12]}"
-    args = {
-        "request_id": state.get("request_id"),
-        "user_id": state.get("user_id"),
-        "intent": state.get("intent"),
-        "risk_level": state.get("risk_level"),
-        "latest_user_message": state.get("latest_user_message"),
-    }
+    args = _write_args(state)
 
     if emit:
         await emit(
@@ -466,34 +591,20 @@ async def execute_approved_action(
         )
 
     async def record_change_ticket() -> int | None:
-        """Register the approved work in the system we actually own.
-
-        This part is real: it creates a change ticket through the same Java endpoint a
-        user-raised ticket goes through, so an approval leaves an auditable trail even when
-        the external call cannot be made. It is not a substitute for the external action and
-        the outcome text says so.
-        """
         if not (requested_action.records_change_ticket and settings.high_risk_records_change_ticket):
             return None
-        ticket_args = {
-            **args,
-            "type": "change",
-            "title": f"[变更] {requested_action.description}",
-            "description": (
+        return await _record_change_ticket(
+            state,
+            adapter,
+            args,
+            title=f"[变更] {requested_action.description}",
+            description=(
                 f"由高风险审批触发。\n审批单：{approval_id or '未记录'}\n"
                 f"意图：{state.get('intent')}\n原始请求：{state.get('latest_user_message')}\n"
-                f"待执行动作：{pending_action}（目标系统尚未接入）"
+                f"待执行动作：{pending_action}"
+                + ("（目标系统尚未接入）" if not requested_action.external_implemented else "")
             ),
-        }
-        refusal = enforce_tool_rails("ticket_create", ticket_args, {})
-        if refusal is not None:
-            return None
-        result = await adapter.execute("ticket_create", ticket_args, state)
-        if not result.get("success"):
-            return None
-        data = result.get("data") or {}
-        number = data.get("number")
-        return int(number) if isinstance(number, (int, float, str)) and str(number).isdigit() else None
+        )
 
     async def invoke(provider_key: str) -> dict[str, Any]:
         call_args = {**args, "idempotency_key": provider_key}

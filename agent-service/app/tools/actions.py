@@ -5,16 +5,21 @@ Before this existed, `prepare_approval` guessed a `pending_action` from the *age
 adapter answered every one of them with a hardcoded success string: "账号和配置已开通",
 "报销单已提交并进入付款流程". The approval was real; the execution was prose.
 
-This registry makes the two facts separate and queryable:
+Every action declared here is now **real**. The two fictional ones (`vpn_api_provision`,
+`finance_submit`) were deleted once it became clear that connecting them would have meant
+writing an HTTP client against an API that does not exist and calling it an integration.
+A request whose target system is not integrated no longer gets an action at all, and the
+approved request is registered as a change ticket instead -- see
+`service_workflow.execute_approved_action`.
+
+This registry makes the facts separate and queryable:
 
 ``external_implemented``
-    whether the target system is actually integrated. For every action today this is
-    **False**, so the honest outcome of an approved action is "approved, not executed"
-    rather than a fabricated success.
+    whether the target system is actually integrated. For an action that is not, the honest
+    outcome is "approved, not executed" rather than a fabricated success.
 ``records_change_ticket``
-    whether we register the approved work in the system we *do* own. This part is real:
-    a row lands in the Java ticket table, so an approval leaves an auditable trail even
-    when the external call cannot be made.
+    whether we register the approved work in the system we *do* own, so an approval leaves an
+    auditable trail even when the external call cannot be made.
 """
 
 from __future__ import annotations
@@ -49,27 +54,22 @@ class WriteAction:
 #: Actions keyed by the intent that requires them. The mapping is by intent rather than by
 #: agent because an agent can serve several intents and only some of them write anything.
 INTENT_ACTIONS: dict[str, str] = {
-    "network.vpn.request": "vpn_api_provision",
-    "finance.service.submit": "finance_submit",
+    "support.ticket.merge": "ticket_merge",
 }
 
 ACTIONS: dict[str, WriteAction] = {
-    "vpn_api_provision": WriteAction(
-        name="vpn_api_provision",
-        description="在 VPN 系统开通账号与访问配置",
-        external_implemented=False,
-        records_change_ticket=True,
-        # Employee requests, administrator approves, the system provisions. The employee does
-        # not hold `network:vpn:create` and never should; the approval is what authorizes this.
-        authority=AUTHORITY_SYSTEM,
-    ),
-    "finance_submit": WriteAction(
-        name="finance_submit",
-        description="在 ERP 提交报销单并进入付款流程",
-        external_implemented=False,
-        records_change_ticket=True,
-        # The employee submits their own reimbursement, so they must hold the permission and the
-        # approval is a second signature on top of it.
+    "ticket_merge": WriteAction(
+        name="ticket_merge",
+        description="合并两张工单（源工单关闭并指向目标，通信记录迁移）",
+        # Implemented for real: it calls the Java ticket service through the internal tool
+        # endpoint. The effect is irreversible -- the source becomes a tombstone -- which is
+        # exactly why a second signature is required.
+        external_implemented=True,
+        # The merge itself is the record; there is nothing else to register.
+        records_change_ticket=False,
+        # `TicketService.merge` calls `requireAgent`, so the acting identity must be staff. The
+        # requester therefore already holds the permission and the approval is dual control,
+        # rather than the system acting for someone who could not do it themselves.
         authority=AUTHORITY_REQUESTER,
     ),
 }

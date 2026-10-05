@@ -263,10 +263,10 @@ async def test_routing_sends_tickets_to_the_real_adapter_and_marks_the_rest_simu
 def test_tool_status_separates_real_from_mock():
     status = tool_status()
 
-    # Four adapters exist; only two are reachable from chat today, and the report says so
-    # rather than implying all four are wired.
+    # Five ticket tools are implemented; four are reachable as ordinary tools today, and
+    # `ticket_merge` is reachable only through an approval. The report distinguishes them.
     assert set(status["implemented"]) == set(TICKET_TOOLS)
-    assert set(status["declared_real"]) == {"ticket_create", "ticket_list"}
+    assert set(status["declared_real"]) == {"ticket_create", "ticket_list", "ticket_merge"}
     assert set(status["implemented_not_wired"]) == {"ticket_get", "ticket_comment"}
     assert "idp" in status["declared_mock"]
     assert "mdm" in status["declared_mock"]

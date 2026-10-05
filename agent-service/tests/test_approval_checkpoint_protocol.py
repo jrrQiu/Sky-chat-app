@@ -10,7 +10,6 @@ These cover the acceptance criteria of the checkpoint design:
 
 import asyncio
 import copy
-import dataclasses
 import time
 import uuid
 
@@ -39,12 +38,14 @@ from app.services.resume_reconciler import reconcile_once
 from app.tools.adapters.mock import execute_mock_tool
 
 
-WRITE_ACTION = "vpn_api_provision"
+WRITE_ACTION = "ticket_merge"
 
 # The requester is `u1`; separation of duties means the decider must be someone
 # else holding one of the approval's required roles.
 APPROVER_ID = "approver1"
-APPROVER_ROLES = ["network_admin"]
+# The generic `approver` role: every agent's required-approver list includes it, so the protocol
+# tests do not break each time the request routes to a different agent.
+APPROVER_ROLES = ["approver"]
 
 
 async def _decide(
@@ -65,8 +66,11 @@ async def _decide(
     )
 
 
-def make_request(request_id: str, message: str = "申请VPN权限") -> ChatRequest:
-    roles = ["network_admin"]
+def make_request(request_id: str, message: str = "帮我把 #12 合并到 #14") -> ChatRequest:
+    # The message has to resolve to an intent that has a *declared* action, otherwise there is
+    # nothing for the resume to execute and the exactly-once assertions below would be vacuous.
+    # `support.ticket.merge` is the one real action; `it_staff` holds `ticket:merge`.
+    roles = ["it_staff"]
     return ChatRequest(
         request_id=request_id,
         user_context=UserContext(userId="u1", roles=roles),
@@ -91,6 +95,11 @@ class CountingAdapter:
 
     async def execute(self, tool_name, args, state):
         self.calls.append((tool_name, args))
+        if tool_name == WRITE_ACTION:
+            # The approved action is declared as integrated, so the double behaves like a
+            # reachable target system rather than falling through to the mock's unknown-tool
+            # refusal.
+            return {"success": True, "text": "已执行。", "data": {"merged": True}}
         return await execute_mock_tool(tool_name, args, state)
 
     def names(self) -> list[str]:
@@ -117,25 +126,6 @@ def _isolate_state(monkeypatch):
     approval_store._tasks.clear()
     ledger_module.effect_ledger._records.clear()
     ledger_module.effect_ledger._locks.clear()
-
-
-@pytest.fixture(autouse=True)
-def _integrated_write_action(monkeypatch):
-    """Treat the write action as having an integrated target system.
-
-    These tests are about the exactly-once *protocol*: the ledger must not run an approved
-    write twice across a restart or a resume. By default every action in the registry reports
-    `external_implemented=False`, and `execute_approved_action` then deliberately never calls
-    the adapter -- correct for production, but it would make an exactly-once assertion vacuous.
-    Marking the action integrated here exercises the path under test.
-    """
-    from app.tools import actions as actions_module
-
-    integrated = dataclasses.replace(
-        actions_module.ACTIONS[WRITE_ACTION], external_implemented=True
-    )
-    monkeypatch.setitem(actions_module.ACTIONS, WRITE_ACTION, integrated)
-    yield
 
 
 @pytest.fixture
@@ -819,7 +809,7 @@ def test_requester_cannot_approve_their_own_request(adapter):
                 "approved",
                 resume_request_id="rsq_sod",
                 user_id="u1",  # the requester
-                actor_roles=["network_admin"],
+                actor_roles=["it_staff"],
             )
         assert exc.value.code == "SELF_APPROVAL_FORBIDDEN"
 
@@ -837,7 +827,7 @@ def test_decider_must_hold_a_required_approver_role(adapter):
         approval_id = approvals[0]["approval_id"]
 
         task = await approval_store.get(approval_id)
-        assert "network_admin" in task.required_approver_roles
+        assert "it_staff" in task.required_approver_roles
 
         with pytest.raises(ApprovalPolicyError) as exc:
             await approval_store.decide(
@@ -898,7 +888,7 @@ def test_decision_trail_records_who_decided_and_why():
         assert trail[0]["decision"] == "approved"
         assert trail[0]["decided_by"] == APPROVER_ID
         assert trail[0]["comment"] == "approved for the Q3 audit"
-        assert "network_admin" in trail[0]["decided_by_roles"]
+        assert "approver" in trail[0]["decided_by_roles"]
 
         row = repo.rows[task.id]
         assert row["decided_by"] == APPROVER_ID
@@ -922,7 +912,9 @@ def test_a_refused_decision_does_not_consume_the_approval(adapter):
                 "approved",
                 resume_request_id="rsq_refused",
                 user_id="u1",
-                actor_roles=["network_admin"],
+                # A role that is not in this request's required-approver list, so the decision is
+                # refused and the CAS window stays open.
+                actor_roles=["employee"],
             )
 
         decision = await _decide(

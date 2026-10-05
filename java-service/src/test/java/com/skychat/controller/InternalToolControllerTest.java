@@ -236,6 +236,63 @@ class InternalToolControllerTest {
         assertThat(audits.origins).contains("agent");
     }
 
+    @Test
+    @DisplayName("ticket_merge merges the two named tickets and audits the merge")
+    void mergeResolvesAndDelegates() {
+        tickets.page = new TicketService.Page(
+                List.of(TicketSummary.of(FakeTicketService.ticket("t9", 9, "new"))),
+                1, 0, 1, Map.of(), Map.of()
+        );
+        tickets.mergeResult = new TicketService.MergeResult(
+                FakeTicketService.detail("t9", 9, "incident", "closed", "medium", "重复单"),
+                FakeTicketService.detail("t12", 12, "incident", "open", "medium", "主单")
+        );
+
+        ResponseEntity<Object> response = invoke(
+                callerToken("staff-1", List.of("it_staff")),
+                "ticket_merge",
+                Map.of("sourceNumber", 9, "targetTicketId", "t12")
+        );
+
+        assertThat(bodyOf(response)).containsEntry("success", true);
+        assertThat(String.valueOf(bodyOf(response).get("text"))).contains("#9").contains("#12");
+        assertThat(tickets.mergeSource).isEqualTo("t9");
+        assertThat(tickets.mergeTarget).isEqualTo("t12");
+        assertThat(tickets.lastCaller.userId()).isEqualTo("staff-1");
+        assertThat(audits.actions).contains("ticket.merge");
+    }
+
+    @Test
+    @DisplayName("a merge without two tickets is refused and never reaches the service")
+    void mergeNeedsTwoTickets() {
+        ResponseEntity<Object> response = invoke(
+                callerToken("staff-1", List.of("it_staff")),
+                "ticket_merge",
+                Map.of("sourceTicketId", "t9")
+        );
+
+        assertThat(bodyOf(response)).containsEntry("success", false);
+        assertThat(String.valueOf(bodyOf(response).get("text"))).contains("未执行合并");
+        assertThat(tickets.mergeSource).isNull();
+    }
+
+    @Test
+    @DisplayName("a refused merge keeps its business error code instead of becoming a 500")
+    void mergeRefusalIsAToolOutcome() {
+        tickets.failure = new AuthException(TicketService.MERGE_SELF, "不能把工单合并到它自己");
+
+        ResponseEntity<Object> response = invoke(
+                callerToken("staff-1", List.of("it_staff")),
+                "ticket_merge",
+                Map.of("sourceTicketId", "t9", "targetTicketId", "t9")
+        );
+
+        // The refusal is a normal tool outcome the agent can relay, not an HTTP error.
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(bodyOf(response)).containsEntry("success", false);
+        assertThat(bodyOf(response)).containsEntry("error", TicketService.MERGE_SELF);
+    }
+
     // ------------------------------------------------------------------ fakes
 
     private static final class FakeTicketService extends TicketService {
@@ -251,6 +308,9 @@ class InternalToolControllerTest {
         private String lastRequester;
         private String lastQuery;
         private String lastVisibility;
+        private TicketService.MergeResult mergeResult;
+        private String mergeSource;
+        private String mergeTarget;
 
         FakeTicketService() {
             super(null, null, null, null, null);
@@ -333,6 +393,17 @@ class InternalToolControllerTest {
             lastCaller = caller;
             lastVisibility = visibility;
             return detail;
+        }
+
+        @Override
+        public MergeResult merge(Caller caller, String sourceId, String targetId) {
+            if (failure != null) {
+                throw failure;
+            }
+            lastCaller = caller;
+            mergeSource = sourceId;
+            mergeTarget = targetId;
+            return mergeResult;
         }
     }
 

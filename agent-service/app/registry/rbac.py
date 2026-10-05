@@ -26,6 +26,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "ticket:read",
         "ticket:create",
         "ticket:comment",
+        "ticket:merge",
     },
     "network_user": {
         "network:vpn:read",
@@ -41,6 +42,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "ticket:read",
         "ticket:create",
         "ticket:comment",
+        "ticket:merge",
     },
     "hr_user": {
         "hr:leave:read",
@@ -56,6 +58,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "ticket:read",
         "ticket:create",
         "ticket:comment",
+        "ticket:merge",
     },
     "finance_user": {
         "finance:invoice:read",
@@ -86,6 +89,9 @@ TOOL_PERMISSIONS: dict[str, set[str]] = {
     "ticket_comment": {"ticket:comment"},
     "ticket_get": {"ticket:read"},
     "ticket_list": {"ticket:read"},
+    # Merging is destructive (the source becomes a tombstone), so it is staff-only and gated
+    # behind an approval on top of that.
+    "ticket_merge": {"ticket:merge"},
     "agent_registry": {"agent:select"},
     "policy_api": {"run:read"},
     "idp": {"it:password_reset"},

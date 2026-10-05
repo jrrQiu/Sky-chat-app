@@ -243,6 +243,28 @@ rules:
       - 我的打印机坏了
       - 系统登录不了
 
+  # Merging tickets. High risk on purpose: the source ticket becomes a tombstone and its
+  # conversation log moves, so it goes through approval, and the merge itself is the first
+  # approved write action with a real, irreversible effect.
+  - id: support.ticket.merge
+    priority: 54
+    enabled: true
+    domain: it
+    operation: submit
+    intent: support.ticket.merge
+    agent_id: it
+    action: submit
+    risk: high
+    confidence: 0.93
+    pattern: (合并.*工单|工单.*合并|把\s*#?\d+\s*合并|合并\s*#?\d+|重复(提交|提单|报障)|提重了|报重了|merge.*tickets?)
+    plan:
+      - collect_slots
+      - check_permission
+      - execute_it_tool
+    examples:
+      - 帮我把 #12 合并到 #14
+      - 我重复提交了两张工单，帮我合并
+
   # The user asking about their own tickets. Routed to a *service* agent on purpose:
   # the knowledge subgraph only retrieves, it does not run tools, so a ticket lookup
   # sent there would never execute.

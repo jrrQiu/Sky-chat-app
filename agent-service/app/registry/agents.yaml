@@ -36,6 +36,9 @@ agents:
       - software_center
       - ticket_create
       - ticket_list
+      # Staff-only and destructive; reachable only through an approval, never selected as a
+      # normal tool (see the assertion in tests/test_write_actions.py).
+      - ticket_merge
     permissions:
       - it:password_reset
       - it:device:read
@@ -52,6 +55,7 @@ agents:
       - permission_system
       - ticket_create
       - ticket_list
+      - ticket_merge
     permissions:
       - network:vpn:read
       - network:vpn:create
@@ -68,6 +72,7 @@ agents:
       - form_service
       - ticket_create
       - ticket_list
+      - ticket_merge
     permissions:
       - hr:profile:read
       - hr:leave:read

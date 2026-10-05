@@ -14,7 +14,6 @@ What this proves that the in-memory tests cannot:
 """
 
 import asyncio
-import dataclasses
 import os
 
 import psycopg
@@ -45,7 +44,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TURN_ID = "turn_pg_integration"
-WRITE_ACTION = "vpn_api_provision"
+WRITE_ACTION = "ticket_merge"
 
 
 def _run(scenario) -> None:
@@ -123,20 +122,9 @@ def _cleanup() -> None:
 @pytest.fixture(autouse=True)
 def _clean_pg_state(pg_env, monkeypatch):
     async def fake_stream_completion(**_kwargs):
-        yield ("answer", "已完成 VPN 开通。")
+        yield ("answer", "已完成工单合并。")
 
     monkeypatch.setattr(generate_node, "stream_completion", fake_stream_completion)
-
-    # The write action must reach the adapter for the exactly-once assertion to mean
-    # anything. Every action reports `external_implemented=False` by default, and
-    # `execute_approved_action` then deliberately skips the adapter, so this test marks it
-    # integrated to exercise the path it is actually about.
-    from app.tools import actions as actions_module
-
-    integrated = dataclasses.replace(
-        actions_module.ACTIONS[WRITE_ACTION], external_implemented=True
-    )
-    monkeypatch.setitem(actions_module.ACTIONS, WRITE_ACTION, integrated)
 
 
 class CountingAdapter:
@@ -171,15 +159,18 @@ def make_request(turn_id: str):
         UserContext,
     )
 
-    roles = ["network_admin"]
+    # The message must resolve to an intent with a *declared* action, or the resume has nothing
+    # to execute and the exactly-once assertion below would be vacuous. `support.ticket.merge` is
+    # the one real action, and `it_staff` holds `ticket:merge`.
+    roles = ["it_staff"]
     return ChatRequest(
         request_id=turn_id,
         user_context=UserContext(userId="u1", roles=roles),
         conversation_id="c1",
         user_message_id="m1",
         assistant_message_id="m2",
-        messages=[ChatMessage(role="user", content="申请VPN权限")],
-        latest_user_message="申请VPN权限",
+        messages=[ChatMessage(role="user", content="帮我把 #12 合并到 #14")],
+        latest_user_message="帮我把 #12 合并到 #14",
         agent_state=AgentStatePayload(
             requestId=turn_id,
             userContext=UserContext(userId="u1", roles=roles),
@@ -265,7 +256,8 @@ def test_interrupt_is_persisted_and_resumes_across_a_new_pool(adapter):
                 "approved",
                 resume_request_id="rsq_pg",
                 user_id="approver1",
-                actor_roles=["network_admin"],
+                # The generic approver role, which every agent's required list includes.
+                actor_roles=["approver"],
             )
             assert decision.won is True
 
@@ -387,7 +379,7 @@ def test_approval_store_cas_is_single_winner_against_postgres():
                     "approved",
                     resume_request_id=f"rsq_{index}",
                     user_id="approver1",
-                    actor_roles=["network_admin"],
+                    actor_roles=["approver"],
                 )
                 for index in range(8)
             ]

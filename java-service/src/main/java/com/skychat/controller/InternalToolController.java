@@ -126,6 +126,7 @@ public class InternalToolController {
                 case "ticket_get" -> ticketGet(actor, args);
                 case "ticket_list" -> ticketList(actor, args);
                 case "ticket_comment" -> ticketComment(actor, args, caller, exchange);
+                case "ticket_merge" -> ticketMerge(actor, args, caller, exchange);
                 default -> ok(failure("未知工具：" + toolName));
             };
         } catch (AuthException error) {
@@ -242,13 +243,69 @@ public class InternalToolController {
         return ok(success("已回复工单 #" + updated.number() + "。", ticketData(updated)));
     }
 
+    /**
+     * Merge two tickets. This is the first tool here with an irreversible effect: the source
+     * ticket becomes a tombstone pointing at the target, and its conversation log moves.
+     *
+     * <p>Authorization is unchanged and stays in {@link TicketService}: {@code merge} calls
+     * {@code requireAgent}, so the acting identity must be staff. The agent service only reaches
+     * this after an approval, and the approval authorises the action without granting a
+     * permission the requester did not hold -- which is why the requester here is a staff member
+     * rather than an end user.</p>
+     */
+    private ResponseEntity<Object> ticketMerge(
+            TicketService.Caller actor,
+            Map<String, Object> args,
+            InternalTokenService.AgentCaller caller,
+            ServerWebExchange exchange
+    ) {
+        String sourceId = resolveId(
+                actor,
+                text(args.get("sourceTicketId"), null),
+                integer(args.get("sourceNumber"), null)
+        );
+        String targetId = resolveId(
+                actor,
+                text(args.get("targetTicketId"), null),
+                integer(args.get("targetNumber"), null)
+        );
+        if (sourceId == null || targetId == null) {
+            return ok(failure(
+                    "需要提供要合并的两张工单：sourceTicketId/sourceNumber 与 "
+                            + "targetTicketId/targetNumber。未执行合并。"
+            ));
+        }
+
+        TicketService.MergeResult merged = ticketService.merge(actor, sourceId, targetId);
+        audit(caller.userId(), "ticket.merge", sourceId, "success", exchange, Map.of(
+                "origin", "agent",
+                "tool", "ticket_merge",
+                "sourceNumber", merged.source().number(),
+                "targetNumber", merged.target().number()
+        ));
+        return ok(success(
+                "已把工单 #" + merged.source().number() + " 合并到 #" + merged.target().number()
+                        + "；源工单已关闭并指向目标，其通信记录已迁移。",
+                Map.of(
+                        "source", ticketData(merged.source()),
+                        "target", ticketData(merged.target())
+                )
+        ));
+    }
+
     /** Accepts either the opaque id or the human number, because a user says "#12". */
     private String resolveTicketId(TicketService.Caller actor, Map<String, Object> args) {
-        String id = text(args.get("ticketId"), null);
+        return resolveId(
+                actor,
+                text(args.get("ticketId"), null),
+                integer(args.get("number"), null)
+        );
+    }
+
+    private String resolveId(TicketService.Caller actor, String id, Integer number) {
         if (id != null && !id.isBlank()) {
             return id.trim();
         }
-        Integer number = integer(args.get("number"), null);
         if (number == null) {
             return null;
         }

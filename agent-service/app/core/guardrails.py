@@ -92,6 +92,9 @@ TOOL_ARG_KEYS_EXTRA: dict[str, frozenset[str]] = {
     "ticket_get": frozenset({"ticketId", "number"}),
     "ticket_list": frozenset({"status", "type", "limit"}),
     "ticket_comment": frozenset({"ticketId", "number", "body", "visibility"}),
+    "ticket_merge": frozenset(
+        {"sourceTicketId", "targetTicketId", "sourceNumber", "targetNumber"}
+    ),
 }
 
 
