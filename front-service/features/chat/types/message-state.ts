@@ -30,6 +30,13 @@ export interface ActiveTool {
 export interface MessageRuntimeState {
   phase: MessagePhase
   activeTools: Map<string, ActiveTool>
+  /**
+   * 服务端的错误说明（`ERROR` 事件携带）。
+   *
+   * 之前这里只留了阶段，`message` 被丢掉，于是界面在任何失败下都显示固定的"生成失败"——
+   * "本次生成已有 120s 没有进展，请重试"这类可操作的信息到不了用户眼前。
+   */
+  errorMessage?: string
 }
 
 export type PhaseEvent = 

@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { MarkdownIcon } from '@/components/icons/MarkdownIcon'
 import { TextFileIcon } from '@/components/icons/TextFileIcon'
 import { cn } from '@/lib/utils'
+import { CHAT_COMPOSER_INPUT_ID } from '@/features/chat/utils/focus-composer'
 
 // 定义它需要接收的所有外部参数
 export interface ChatInputUIProps {
@@ -149,6 +150,7 @@ export function ChatInputUI({
           {/* 中间部分：输入框 */}
           <form onSubmit={onSubmit} className="relative mb-2">
             <input
+              id={CHAT_COMPOSER_INPUT_ID}
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}

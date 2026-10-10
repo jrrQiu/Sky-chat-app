@@ -35,7 +35,12 @@ def test_locked_account_routes_to_it():
 
 
 def test_ambiguous_request_falls_back_to_knowledge():
-    result = resolve_intent("帮我处理一下")
+    # `semantic_enabled=False` on purpose: this asserts the *rule* fallback. A
+    # developer with embeddings configured in `.env` would otherwise have the
+    # semantic classifier resolve this phrase first (it reasonably maps
+    # "帮我处理一下" toward IT), so the test would depend on ambient configuration
+    # instead of on the fallback it is named after.
+    result = resolve_intent("帮我处理一下", semantic_enabled=False)
     assert result.agent_id == "knowledge"
     assert result.operation == "query"
     assert result.confidence < 0.60
@@ -52,7 +57,10 @@ def test_llm_fallback_is_used_when_rule_confidence_is_low():
                 "entities": {"product": "报销"},
             }
 
-    result = resolve_intent("帮我处理一下", llm_client=FakeIntentLLM())
+    # Semantic path off so the assertion is about the LLM fallback specifically.
+    result = resolve_intent(
+        "帮我处理一下", llm_client=FakeIntentLLM(), semantic_enabled=False
+    )
 
     assert result.domain == "finance"
     assert result.intent == "finance.reimbursement.query"

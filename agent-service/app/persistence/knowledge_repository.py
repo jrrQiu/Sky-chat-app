@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import psycopg
 import psycopg.rows
@@ -16,6 +17,22 @@ from app.knowledge.models import (
     TicketEvent,
 )
 from app.retrieval.types import RetrievalIndex
+
+logger = logging.getLogger(__name__)
+
+# The ANN index name is referenced by `has_ann_index()`, so it is a constant rather
+# than a literal in two places that could drift.
+ANN_INDEX_NAME = "idx_knowledge_chunk_embedding_hnsw"
+
+
+def _vector_literal(vector: Sequence[float]) -> str:
+    """pgvector's text input format: `[1.0,2.0,...]`.
+
+    Built by hand rather than relying on `pgvector.psycopg.register_vector`, so the
+    repository has no import-time dependency on the optional package and so the
+    value is accepted by a plain `::vector` cast regardless of driver registration.
+    """
+    return "[" + ",".join(repr(float(value)) for value in vector) + "]"
 
 
 class PostgresKnowledgeRepository:
@@ -50,9 +67,220 @@ class PostgresKnowledgeRepository:
                 cur.execute("SELECT COUNT(*) FROM knowledge_document")
                 return int(cur.fetchone()[0])
 
+    def count_chunk_embeddings(self) -> int:
+        """How many chunks actually carry a vector.
+
+        This is the number that decides whether the ANN path is usable. It exists
+        because the previous state of the world — `embedding` columns defined and
+        always NULL — was indistinguishable from a working vector store unless
+        somebody counted the rows.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(embedding) FROM knowledge_chunk")
+                return int(cur.fetchone()[0])
+
+    def count_chunks(self) -> int:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM knowledge_chunk")
+                return int(cur.fetchone()[0])
+
+    def has_ann_index(self) -> bool:
+        """True when an HNSW/IVFFlat index exists on the chunk vector column.
+
+        Without it `ORDER BY embedding <=> %s` is still *correct* but degrades to a
+        sequential scan, so readiness has to report the difference rather than
+        claiming a vector store is serving.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM pg_indexes
+                    WHERE tablename = 'knowledge_chunk'
+                      AND (indexdef ILIKE '%hnsw%' OR indexdef ILIKE '%ivfflat%')
+                    """
+                )
+                return int(cur.fetchone()[0]) > 0
+
+    def ensure_ann_index(self) -> bool:
+        """Create the HNSW index if it is missing. Returns whether one now exists.
+
+        Built without a partial predicate: pgvector's HNSW index tolerates NULL
+        vectors and the ANN scan skips them, whereas a partial index would only be
+        usable by queries carrying a matching `WHERE embedding IS NOT NULL`, which
+        the search does not need and would have to be kept in sync with.
+        """
+        ddl = (
+            f"CREATE INDEX IF NOT EXISTS {ANN_INDEX_NAME} ON knowledge_chunk "
+            f"USING hnsw (embedding vector_cosine_ops) "
+            f"WITH (m = {int(settings.vector_hnsw_m)}, "
+            f"ef_construction = {int(settings.vector_hnsw_ef_construction)})"
+        )
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(ddl)
+            return True
+        except Exception:
+            logger.warning(
+                "Could not create the HNSW index; dense search will fall back to a "
+                "sequential scan",
+                exc_info=True,
+            )
+            return False
+
+    def search_chunks_by_vector(
+        self,
+        query_vector: Sequence[float],
+        *,
+        top_k: int = 50,
+        chunk_ids: set[str] | None = None,
+        kb_ids: set[str] | None = None,
+        roles: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """ANN search with every filter pushed into the statement.
+
+        ACL is applied here rather than after retrieval. Filtering in Python would
+        both leak (a forbidden chunk would be ranked before being dropped) and lose
+        recall (a post-filtered top-50 can leave two rows). `roles=None` means "no
+        scoping" — startup checks and evals; the request path always passes the
+        caller's roles.
+
+        `<=>` is cosine *distance*, so similarity is `1 - distance`, which keeps the
+        score comparable with the in-memory backend's cosine similarity.
+        """
+        if not query_vector:
+            return []
+
+        conditions: list[str] = ["c.embedding IS NOT NULL"]
+        params: dict[str, Any] = {
+            "query_vector": _vector_literal(query_vector),
+            "limit": max(1, int(top_k)),
+            # pgvector's default ef_search is 40; higher trades latency for recall.
+            "ef_search": max(1, int(settings.vector_hnsw_ef_search)),
+        }
+        if chunk_ids is not None:
+            conditions.append("c.id = ANY(%(chunk_ids)s)")
+            params["chunk_ids"] = list(chunk_ids)
+        if kb_ids is not None:
+            conditions.append("d.kb_id = ANY(%(kb_ids)s)")
+            params["kb_ids"] = list(kb_ids)
+        conditions.append("d.status = 'active'")
+        if roles is not None:
+            # Chunks inherit their document's ACL: a chunk whose document is not
+            # visible to the caller must never be retrievable.
+            conditions.append(
+                "(d.allowed_roles = '[]'::jsonb OR d.allowed_roles ?| %(roles)s)"
+            )
+            params["roles"] = sorted(roles)
+
+        where = " AND ".join(conditions)
+        sql = f"""
+            SELECT c.*, 1 - (c.embedding <=> %(query_vector)s::vector) AS score
+            FROM knowledge_chunk c
+            JOIN knowledge_document d ON d.id = c.document_id
+            WHERE {where}
+            ORDER BY c.embedding <=> %(query_vector)s::vector
+            LIMIT %(limit)s
+        """
+        with self._connect() as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                if settings.vector_store_enabled:
+                    # Local to this transaction, which is exactly the scope we want.
+                    cur.execute(
+                        "SELECT set_config('hnsw.ef_search', %s, true)",
+                        (str(params["ef_search"]),),
+                    )
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        return [
+            {"chunk": self._chunk_from_row(row), "score": float(row.get("score") or 0.0)}
+            for row in rows
+        ]
+
+    @staticmethod
+    def _chunk_from_row(row: dict[str, Any]) -> KnowledgeChunk:
+        return KnowledgeChunk(
+            id=row["id"],
+            document_id=row["document_id"],
+            parent_chunk_id=row["parent_chunk_id"],
+            chunk_index=row["chunk_index"],
+            content=row["content"],
+            keywords=list(row["keywords"] or []),
+            section_path=list(row["section_path"] or []),
+            page=row["page"],
+            token_count=row["token_count"],
+        )
+
+    def _persist_embeddings(
+        self,
+        chunks: list[KnowledgeChunk],
+        only_missing: bool = False,
+    ) -> int:
+        """Embed chunks in batches, write the vectors, then build the ANN index.
+
+        Runs in its own connection *after* the content transaction has committed, so
+        an embedding provider outage degrades the dense channel (rows stay NULL, the
+        lexical channels keep working) instead of losing the content write.
+        """
+        from app.retrieval.embedding import default_embedding_provider
+
+        provider = default_embedding_provider()
+        if provider is None or not chunks:
+            return 0
+
+        targets = chunks
+        if only_missing:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM knowledge_chunk WHERE embedding IS NULL"
+                    )
+                    missing = {row[0] for row in cur.fetchall()}
+            targets = [chunk for chunk in chunks if chunk.id in missing]
+        if not targets:
+            return 0
+
+        from app.retrieval.cache import embed_with_cache
+
+        written = 0
+        for start in range(0, len(targets), settings.embedding_batch_size):
+            window = targets[start : start + settings.embedding_batch_size]
+            vectors = embed_with_cache([chunk.content for chunk in window], provider)
+            payload = [
+                {"id": chunk.id, "embedding": _vector_literal(vector)}
+                for chunk, vector in zip(window, vectors)
+                if vector
+            ]
+            if not payload:
+                continue
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        UPDATE knowledge_chunk
+                        SET embedding = %(embedding)s::vector
+                        WHERE id = %(id)s
+                        """,
+                        payload,
+                    )
+            written += len(payload)
+
+        if written:
+            self.ensure_ann_index()
+        return written
+
     def seed(self, index: RetrievalIndex) -> None:
         with self._connect() as conn:
             with conn.cursor() as cur:
+                # Which chunks already have content, so the embedding pass can skip
+                # re-embedding text that did not change. Read before the upserts.
+                cur.execute("SELECT id, content FROM knowledge_chunk")
+                existing_chunk_content = dict(cur.fetchall())
+
                 for kb in index.knowledge_bases:
                     cur.execute(
                         """
@@ -122,6 +350,13 @@ class PostgresKnowledgeRepository:
                     )
 
                 for chunk in index.chunks:
+                    # `embedding` is deliberately not touched here. A chunk whose
+                    # content changed must lose its vector, because a stale vector
+                    # silently ranks a chunk by text that no longer exists. The
+                    # reset and the re-embed both happen in `_persist_embeddings`
+                    # after this transaction commits, so a provider outage cannot
+                    # roll back the content write.
+                    content_changed = existing_chunk_content.get(chunk.id) not in (None, chunk.content)
                     cur.execute(
                         """
                         INSERT INTO knowledge_chunk (
@@ -136,7 +371,12 @@ class PostgresKnowledgeRepository:
                             content = EXCLUDED.content,
                             keywords = EXCLUDED.keywords,
                             section_path = EXCLUDED.section_path,
-                            token_count = EXCLUDED.token_count
+                            token_count = EXCLUDED.token_count,
+                            embedding = CASE
+                                WHEN knowledge_chunk.content IS DISTINCT FROM EXCLUDED.content
+                                THEN NULL
+                                ELSE knowledge_chunk.embedding
+                            END
                         """,
                         {
                             "id": chunk.id,
@@ -150,6 +390,10 @@ class PostgresKnowledgeRepository:
                             "token_count": chunk.token_count,
                         },
                     )
+                    if content_changed:
+                        logger.info(
+                            "Chunk %s content changed; its vector is being recomputed", chunk.id
+                        )
 
                 for ticket in index.tickets:
                     cur.execute(
@@ -218,6 +462,17 @@ class PostgresKnowledgeRepository:
                             "occurred_at": event.occurred_at,
                         },
                     )
+
+        # Embedding is a separate, best-effort phase. It runs after the content
+        # transaction has committed, so a provider outage leaves the content written
+        # and the vectors NULL — the dense channel degrades and says so, rather than
+        # the ingest failing or the index going stale.
+        try:
+            written = self._persist_embeddings(list(index.chunks))
+            if written:
+                logger.info("Persisted %d chunk embedding(s)", written)
+        except Exception:
+            logger.warning("Chunk embedding pass failed", exc_info=True)
 
         # Writing knowledge invalidates any cached index, here as well as in the ingestion
         # entry point: a caller that reaches this repository directly would otherwise leave a

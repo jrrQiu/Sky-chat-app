@@ -12,6 +12,7 @@ from app.retrieval.embedding import effective_retrieval_mode
 from app.retrieval.query import QueryPlan, understand_query, understand_query_with_model
 from app.retrieval.router import route_knowledge_bases
 from app.retrieval.types import RetrievalIndex, RetrievalResult
+from app.retrieval.vector_store import build_dense_store
 from app.tickets.investigation import investigate_ticket
 
 
@@ -143,6 +144,17 @@ def run_retrieval(
         plan = understand_query(query, kb_keywords)
     kb_ids = route_knowledge_bases(plan, index, user_context)
 
+    # Resolve the dense backend once per run. Persisted vectors are searched with a
+    # single ANN query; without them the in-process scan is used, which is O(n) per
+    # query and only appropriate for the seed corpus.
+    dense_store = build_dense_store(chunks=index.chunks) if embedding_provider else None
+    dense_backend = dense_store.backend if dense_store is not None else None
+
+    # The plan's extracted metadata finally reaches the query. `time_range` used to be
+    # parsed by query understanding and then dropped, so "2024 年的制度" returned the
+    # current one.
+    filters: dict[str, Any] = {"time_range": plan.time_range} if plan.time_range else {}
+
     policy_evidence: list[Any] = []
     policy_issues: list[str] = []
     policy_events: list[dict[str, Any]] = []
@@ -154,6 +166,8 @@ def run_retrieval(
             user_context=user_context,
             rerank_client=rerank_client,
             embedding_provider=embedding_provider,
+            dense_store=dense_store,
+            filters=filters,
         )
 
     ticket_evidence: list[Any] = []
@@ -193,6 +207,9 @@ def run_retrieval(
     plan_payload = plan.to_dict()
     plan_payload["routed_kb_scopes"] = kb_ids
     plan_payload["retrieval_mode"] = retrieval_mode
+    # Which dense backend actually served this run, so a pgvector ANN result is
+    # distinguishable from an in-process scan without reading configuration.
+    plan_payload["dense_backend"] = dense_backend
     plan_payload["retrieval_run"] = (
         {
             "task_type": plan.task_type,

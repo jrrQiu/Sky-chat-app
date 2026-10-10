@@ -749,15 +749,44 @@ export const ChatService = {
               currentStore.updateMessage(messageId, {
                 displayState: 'error',
                 hasError: true,
+                // 服务端的说明与错误码都要留下来：界面用它替代固定的"生成失败"，
+                // 而码决定了该提示"可重试"还是"请先确认结果"。
+                errorMessage: data.message || '生成失败',
+                errorCode: data.errorCode,
                 runId: cursor.runId || undefined,
                 lastSeq: cursor.lastSeq,
               })
               currentStore.stopStreaming('network_error')
             }
+          } else if (data.type === 'clarification_required') {
+            // 工具确定性失败（编号不存在、参数不合法、权限不足）：服务端不再硬失败，而是要求
+            // 补充信息。挂在消息上渲染成一张卡片即可 —— 用户的下一条消息就是"回填"，
+            // 不需要重放本轮，因此这里既不设 terminal 也不改 displayState。
+            const fields = Array.isArray(data.missingFields)
+              ? data.missingFields.filter((item): item is string => typeof item === 'string')
+              : []
+            currentStore.updateMessage(messageId, {
+              clarification: {
+                question:
+                  data.question ||
+                  data.message ||
+                  '请补充关键信息后重试。',
+                missingFields: fields,
+              },
+              runId: cursor.runId || undefined,
+              lastSeq: cursor.lastSeq,
+            })
           } else if (data.type === 'complete') {
             thinkingBuffer.forceFlush()
             answerBuffer.forceFlush()
             this.markCompleted(messageId, cursor)
+          } else if (data.type === 'context_report') {
+            // 上下文引擎的装配报告：服务端用它落库滚动摘要，界面不展示。
+            // 这里显式忽略（而不是落到"未知事件"）是为了让评审能确认它被处理过；
+            // 开发模式下留一条可读日志，方便回答"模型为什么不知道这件事"。
+            if (import.meta.env?.DEV) {
+              console.debug('[ChatService] context_report', data.report)
+            }
           }
         },
       })

@@ -1136,6 +1136,228 @@ on_behalf_of: <申请人 id>
 - **`ticket_comment` 端到端未实测**（见 23.7）。
 - 循环里超过 `agent_max_tool_calls` 的调用被**截断丢弃**而不是排队执行——模型不会知道有调用被丢掉了。
 
+---
+
+## 24. 上下文管理：从"启发式估算"到"可验证的预算引擎"（已实现）
+
+第 2 节把"上下文装配"列为真实优势，第 5 节又列出四条短板（`task_slots` 占位、
+拼接式伪摘要、硬编码提示词、`context_report` 不落地）。本轮按
+`docs/context-engine-design.md` 的 PR1–PR4 全部落地，并且**该文档的问题清单本身
+就有一半是错的或过时的**——下面按"改了什么、哪些说法被证伪、实测抓到什么"记录。
+
+### 24.1 交付内容（PR1–PR4）
+
+| 模块 | 改动 |
+|---|---|
+| `context/tokenizer.py` | 真实 tokenizer（`tiktoken/cl100k_base`）替代 `len/3.2` 启发式；tiktoken 不可用时降级到按文字系统加权的估算器，并在 `/ready` 标注 |
+| `context/model_specs.py` | 模型窗口/输出上限的**单一事实来源**，数值取自厂商页面并记录来源与抓取日期 |
+| `context/policy.py` | 块策略单源（权重/下限/上限/保护级/截断方式）；删掉 Java 与 Python 各一份的优先级副本 |
+| `context/budget.py` | 先保下限、再加权注水、余额回流；**messages 作为参与者进入预算**；硬上限不变量由断言守住 |
+| `context/render.py` | 系统提示的形态集中一处；**脚手架先计量再分配** |
+| `context/report.py` | report v2：每个块的预算/实际/截断/丢弃 id、消息逐出 id、证据 citation_map、provider usage 与误差比 |
+| `context/summary.py` | 增量滚动摘要：覆盖区间来自"实际被逐出的消息"，结构化字段，模型失败回退到确定性抽取且标注 `quality=fallback` |
+| `context/builder.py` | 收敛为编排层；`context_report` 随 SSE 回传 |
+| Java `ConversationContextService` | envelope 升到 `schema_version=2`：**删掉 `task_slots`/`tool_results` 占位块**、结构化摘要、候选窗口 20→40、`limits` 如实体现在 envelope 里 |
+| Java `ConversationSummaryService` | 新增 `persistRolling`（写入引擎报告的覆盖区间与结构化字段）；旧的**每轮覆盖式 `roll` 默认关闭** |
+| Java `StreamEventAccumulator` | 新增：一个可测试的 SSE 事件读取器，**未知事件类型一律忽略**（这是新增事件能向后兼容的原因） |
+| Java `schema.sql` | `conversation_summary` 增 `covered_from_message_id`/`covered_until_message_id`/`field_values`，全部走 `ADD COLUMN IF NOT EXISTS` 守卫 |
+| `eval/metrics.py` | 新增 `check_context_citation_map`：校验"被引用的 `[n]` 在提示里真的存在、编号从 1 连续、且指向实际保留的证据" |
+| 前端 | `context_report` 进 `SSEEventType` 并在 chat service 显式忽略（不落到"未知事件"），dev 模式留一条可读日志 |
+
+### 24.2 被证伪/修正的原判断（重要）
+
+1. **问题 1 说"中文低估约 2×、8192 预算可能送 15k"——数值对，但结论过时。**
+   仓库默认模型是 `deepseek-flash`，实测窗口是 **1M tokens**（厂商文档口径），
+   默认输出预留 4096。也就是说 1M 窗口下"输入超窗"根本不是当前的失效模式；
+   真正的失效模式是**另一种**（见 24.3 第 1 条）。
+2. **问题 2 说 `recent_messages` 完全不受预算约束——已确认，且修掉后暴露出更严重的一层**：
+   它不只是不受约束，而是**根本没有对应的块**（权重表里有 0.24，代码里却只从
+   `context_blocks` 建块）。本轮把它变成真正的参与者。
+3. **"默认 Hash 伪向量"（§15.2）与"tokenizer 不准"（问题 1）不是同一个问题**，
+   不能互相替代：前者影响召回，后者影响窗口是否被撑破。
+4. **`context_report` 的 SSE 事件对 Java 与前端都是向后兼容的**——已逐文件核对：
+   Java 的 `accumulateEvent` 与前端 `chat.service` 都是 if/else 链，未知类型天然被忽略。
+   这一点在落地前是"推测"，现在是核对过的结论（并已把 `context_report` 显式列进
+   前端类型，避免将来把"已知但 UI 不展示"和"未知"混为一谈）。
+5. **模型规格表里的 `deepseek-chat` 没有任何可核实的窗口数值**（厂商页面已无该名称，
+   属退役名）。因此它走保守默认（65536/4096）并在 `/ready` 报 `known: false`，
+   而不是抄一个看起来合理的数字。
+
+### 24.3 实测（真实 PostgreSQL + 真实 tokenizer + 真实模型规格）抓到的四个缺陷
+
+单测全绿之后跑实时校验，抓到四个**单测抓不到**的真缺陷——它们全都属于
+"纸面上算得通、渲染出来就超"或"报告自相矛盾"这一类：
+
+| # | 缺陷 | 为什么单测抓不到 | 修法 |
+|---|---|---|---|
+| 1 | **证据块预算只有 11 tokens，12 条证据全被丢弃** | 单测里证据块的内容是调用方给的字符串，而 `builder` 给的是占位符 `"[12 items]"`；planner 按占位符算 demand，于是只留了小标题的位置 | 块内容改为**渲染后的候选文本**（`render_evidence_items`/`render_tool_results`），demand 按真实内容计 |
+| 2 | **渲染后的提示比预算多几个 token** | 每个块都算对了，小标题也算进了块预算，但渲染器还会用空行连接各节，**连接符本身是 token** | 分配前按块数预留 `SECTION_JOIN_TOKENS` |
+| 3 | **滚动摘要永远生成不出来** | 逐出集合 `{m1..m20, m24}` 不是**连续前缀**（填充会跳过装不下的中间那条），于是 `covered_from=m20, covered_until=m1`，区间切片为空 | 逐出改为**连续前缀**：历史消息装不下就停，更旧的一律逐出（历史上"半句话"本来也不该发） |
+| 4 | **摘要算出来了却不出现在提示里** | 摘要需要 await，在装配之后才折入；而 skeleton 的节清单来自"存在的块"，`conversation_summary` 只有在已有摘要时才存在 → 渲染器无处安放 | skeleton **恒定声明** `conversation_summary` 节，摘要折入时直接渲染 |
+
+这四条的共同根因值得单独记下：**"分配"与"渲染"是两个阶段，任何只在一侧计的
+开销都会变成超窗**；而**"报告里的区间"必须是可切片的连续区间**，否则下游
+（摘要）无法消费它。
+
+### 24.4 验证结果
+
+| 层次 | 结果 |
+|---|---|
+| Python 单测 | **340 项全绿**（本轮新增 54：不变量矩阵、tokenizer 精度与降级、truncate 五种策略、证据装填与重编号、报告校准、摘要区间、引用映射校验、四个回归） |
+| Java 单测 | **237 项全绿**（新增 20：envelope 不再有占位块、结构化摘要与覆盖区间、重放不产生重复版本、`ON CONFLICT` 不覆盖胜者、未知事件类型被忽略、畸形帧不毁这一轮、事件→落库的接线） |
+| 前端 | `tsc --noEmit` 0 错误 |
+| 数据库 | schema 漂移检查 **PASS**（14 张 DDL 声明的表逐列比对 `information_schema`，含三列新加的守卫 ALTER） |
+| 实时校验（真实 PG + 真实 tokenizer） | **21 项通过 / 0 失败**：短会话不逐出、长会话连续逐出、摘要区间可切片且被折入提示、引用编号从 1 连续且都在提示里出现、calibration 有/无 usage 的区分、`ON CONFLICT` 重放只留一版、不可行预算显式拒绝 |
+
+不可行预算的实测尤其值得记：**该拒绝的时候必须拒绝**。第一次实时校验里它
+"装配成功"了——因为测试用的策略上限（4000）比内容小，而当时的检查只看内容不看
+上限；现在内容超过声明上限会走"块足迹超过可用预算"这条聚合校验，短缺点数如实上报。
+
+### 24.5 仍未做（诚实清单）
+
+- **影子模式只是开关，不是实现**：`context_shadow_mode` 已进配置与 `/ready`，但
+  没有"同时算新旧两套并 diff"的代码路径——本轮的取舍是**不保留旧实现**（旧实现的
+  缺陷正是本轮要消除的），因此没有可对比的第二套结果。要真正的影子对比，需要先
+  冻结一份旧引擎。
+- **校准是进程内 EMA**：多副本各自漂移，没有跨副本聚合；`estimate_error_ratio`
+  在单进程内有意义，在集群里只是"某一副本"的观测。
+- **`cl100k_base` 只是近似**：DeepSeek 未公开 tokenizer，因此误差比是必需的护栏；
+  目前只在 `/metrics` 与 `/ready` 暴露，**没有**基于它自动收紧 `safety_margin`。
+- **摘要用的模型调用没有记入 token/成本账本**：它走的是独立 HTTP 调用，
+  `llm.calls` 等指标只覆盖主链路。
+- **`conversation_summary` 没有保留策略**：版本只增不减（每次真实逐出加一版），
+  长期会话会累积；治理策略（保留最近 N 版）未做。
+- **Java 侧没有把 `context_report` 落成结构化日志表**：只写了 debug 日志与滚动摘要，
+  "按 turn 复盘"仍要靠日志检索。
+- **`task_slots` 仍然基本为空**：引擎会正确跳过空占位，但槽位填充本身不在本轮范围。
+- **`recent_messages` 的候选窗口 40 是拍的值**：在 1M 窗口下它远小于可用预算，
+  也就是说当前**窗口没被用满**（实测利用率约 1%）。提高它需要先有"更长的历史
+  是否真的提升回答质量"的评测结论，而不是直接把数字调大。
+
+---
+
+## 25. 工具执行与异常兜底：从"一次调用定生死"到有界韧性（已实现）
+
+按 `docs/tool-execution-and-fallback-design.md` 的 **PR1–PR6 全部落地**。该文档的
+12 条缺口我逐条对着代码核对过，**全部成立**；下面记录交付内容、落地时发现的缺陷，
+以及四处需要用户拍板的决定。
+
+### 25.1 交付内容（PR1–PR6）
+
+| 模块 | 改动 |
+|---|---|
+| `tools/resilience.py`（新） | `RetryPolicy` + `call_with_retry` + `is_safe_to_retry` + 按工具熔断；退避带抖动、**总时长预算**、重试原因入指标 |
+| `tools/calling.py` | 工具选择回合按策略重试；`function_calling_model` 解析器统一模型（T5/缺口 5）；`total_tokens` 改为"输入+输出"（缺口 6 的一部分）；新增 `estimated_tokens`；`tool_result_message` 按 token 截断 + `data` 白名单投影；`_open_stream` 拆出"可重试的连接阶段" |
+| `tools/catalog.py` | 每条工具新增 `write_policy`（direct/confirm/approval）、`result_required`、`result_data_fields` |
+| `graph/nodes/tools.py` | 心跳（`tool_progress` + `runtime.heartbeat()`）；per-tool 熔断；结果契约校验；token 预算用估算推进并标注 `usageSource`；停因事件与指标；`confirm` 档位改为收集待确认写并停止循环 |
+| `confirm_writes`（新节点） | 图级确认：`interrupt()` 在**任何副作用之前**，待确认调用来自 state（重放时 id 稳定），确认后走与循环相同的 RBAC/契约/账本 |
+| `core/effect_ledger.py` | `started` 租约语义：活租约 → `EFFECT_IN_PROGRESS`；过期 → CAS 抢占；失败可重试；取消**不写 failed**（效果未知） |
+| `persistence/postgres_repository.py` | `claim_stale_effect`：`UPDATE ... WHERE status='started' AND updated_at < NOW() - make_interval(secs => …)`，用**库的时钟**判定 |
+| Java `AgentToolIdempotencyMapper` / `ToolIdempotencyService`（新） | 跨服务去重：`Idempotency-Key` → 表 → 同 key 同工具返回首次结果；`ON CONFLICT DO NOTHING` 单赢家；只记成功（不把瞬时失败变永久）；定时清理 |
+| Java `InternalToolController` | 在 switch **之前**读 idempotency，所以没有哪个工具有机会忘记它；重放写审计 `deduplicated` |
+| Java `ApprovalService` | 唯一的职责分离例外：`required_approver_roles="requester"` 时允许申请人自决（写确认）。空值仍然禁止自批 |
+| 前端 `ApprovalDetailDialog` | 同上放开按钮并说明原因；其余审批路径行为不变 |
+| `observability/tool_metrics.py`（新） | `tool.calls`/`tool.latency_ms`/`agent_loop.*`；`/ready` 的 `tool_resilience` 块 |
+| 配置 | 重试次数/退避/总预算、熔断阈值与冷却、心跳节奏、节点空闲窗口、租约开关与时长、`write_confirmation_enabled`、`tool_result_max_tokens`、`function_calling_model` |
+
+### 25.2 落地时发现并修掉的缺陷
+
+| # | 缺陷 | 为什么危险 | 修法 |
+|---|---|---|---|
+| 1 | **`CircuitBreaker.describe()` 死锁**：持有非重入锁后再调 `is_open()`（同一把锁） | 任何一次 `/ready` 或熔断查询都会挂住一个请求线程；表现是"测试卡住不报错" | 状态判断拆成 `_is_open_locked()`，锁改重入 |
+| 2 | **重试指标标签名撞参**：`metrics.counter(name=...)` 与 `counter(name, help, **labels)` 的第一个参数同名 | 触发重试的那一刻抛 `TypeError`，把一次可重试的失败变成工具调用失败 | 标签改 `call=`，并在注册表文档里写明 `name` 是保留名 |
+| 3 | **租约抢占的 CAS 谓词恒不成立**：`_take_over` 传 `stale_before=record.updated_at`，SQL 里是 `updated_at < to_timestamp(stale_before)` → 自己不小于自己 | 崩溃后的每一次重放都被判成"仍在进行中"，写操作**永久卡住** | 改由库的时钟判定：`updated_at < NOW() - lease`；新增 fake 仓库的 CAS 契约测试 |
+| 4 | **规则兜底在预算停之后还会执行**：`mode=="rule-based"` → 调 `select_tools_for_request` | 预算刚拒绝过一次调用，紧接着又执行一个工具（还可能绕过确认档位） | 只有"模型自己说不需要工具"或"从未问过模型"才走兜底；任何停因都不再兜底 |
+| 5 | **`total_tokens` 跨轮累加会重复计 prompt** | 第 3 轮的 `total_tokens` 已含前两轮输入，累加会提前触发 token 预算，把正常循环截断 | 只累加 `promptTokens + completionTokens`（两轮之间不重叠） |
+| 6 | **关闭确认档位后写操作被静默拒绝**：`write_confirmation_enabled=false` 时不进中断分支，于是没有任何 decision，`_execute_confirmed` 全判 rejected | 开关一关，建单/评论全部"未执行"，而 `/ready` 说 confirm 档位已停用——语义相反 | 关闭时把待确认调用直接标为 approved（"不问"而不是"问了然后拒绝"） |
+| 7 | **`confirm` 档位的写全部落在 loop 内**：`ticket_create` 标成 confirm 后，`execute_tools` 仍会执行它 | 确认形同虚设 | 循环只收集待确认写并停止，执行权只给 `confirm_writes` |
+| 8 | **两个节点的 `config` 取用会抛 `AttributeError`**：`config.get(...)` 在非 dict 时不成立 | resume / 测试路径下节点直接崩 | 统一 `_emit(config)` 容错取值 |
+| 9 | **`verdict` 泄漏到函数作用域外** | 关闭确认档位后 `write_confirmations` 写入错误的 `decision` 值 | 改为从 `decisions` 逐条生成 |
+
+### 25.3 四处决定的取舍与理由
+
+1. **图级确认节点，而不是"拒绝即回灌"**（用户选择）：需要一次真实确认，所以放弃
+   了"首次调用返回失败让模型转述"的简化实现。落地后发现这个选择还带来一个额外好处：
+   确认与审批**共用一套 interrupt/checkpoint 协议**，因此 Java 侧与前端复用了既有
+   审批中心，零新增交互形态。
+2. **`requester` 哨兵而不是空角色**：写确认的正确语义是"申请人本人点头"。用空值也能
+   通过角色校验，但那与"没人想过这件事"无法区分。显式写 `requester` + 服务端只对
+   该值放开自决，让例外在数据里可见、在 UI 里可解释。
+3. **`execute_tools` 只加超时、不加 `retry_policy`**（用户选择）：LangGraph 的重试是
+   **重跑整个节点**，对这个节点意味着再问一次模型（真实花费）并重发一轮事件。效果
+   安全由账本兜住，但重复的模型调用与重复事件不值这个价。`generate_answer` /
+   `retrieve_knowledge` 仍有 run timeout。
+4. **Java 真去重**（用户选择）：原本 Python 只在"连接未建立"时重写，也就是不会重发
+   已送出的请求，所以 Java 去重看起来"用不上"。但 T3 要求键端到端，而且这条表让
+   **将来放宽写重试是安全的**——先把地基铺好，比等到需要时再改协议便宜。
+
+### 25.4 验证结果
+
+| 层次 | 结果 |
+|---|---|
+| Python 单测 | **392 项全绿**（本轮新增 55：重试边界 T1/T2、退避与抖动、取消不重试、熔断开合、租约决策表与两进程抢占、心跳、结果契约、token 估算推进、停因指标、`confirm` 档位的图级暂停/通过/驳回/幂等/RBAC/契约） |
+| Java 单测 | **261 项全绿**（新增 24：控制器 idempotency 五例、`ToolIdempotencyService` 十一例、`requester` 自确认五例、保留清理、表不可达时如实标 inactive） |
+| 前端 | `tsc --noEmit` 0 错误 |
+| 实时校验（真实 PostgreSQL + 两个服务在线） | **19/19 通过 / 0 失败**，详见下表 |
+| 数据库 | schema 漂移检查 **PASS**（15 张表逐列比对，含新增的 `agent_tool_idempotency`） |
+
+实时校验逐项结果（`.buildcheck/live_full_chain_check.py`，临时 admin 账号跑完自动停用）：
+
+| 检查 | 实测结果 |
+|---|---|
+| Java `/health` 上报幂等层 | `toolIdempotency.active=true`，去重名单 = `ticket_comment, ticket_create, ticket_merge` |
+| 未签名的内部工具调用 | **401**（新增去重层没有开洞） |
+| 同 `Idempotency-Key` 两次到达 Java | 只建 **1 张工单**；第二次 `deduplicated=true` 且**编号与文本与第一次相同**；`agent_tool_idempotency` 只有 **1 行** |
+| 真实对话的事件序列 | `thinking → tool_call(ticket_create, chosenBy=model) → tool_result(CONFIRMATION_REQUIRED) → approval_required` |
+| 暂停来源 | `rule_id=WRITE-CONFIRMATION-REQUIRED`、`kind=write_confirmation`、`required_approver_roles=requester`、带 `checkpoint_id`+`interrupt_id` |
+| 暂停期间写入 | **0 张**（会话没建单） |
+| `resume` 带 `approve` | `status=resumed`；执行结果 `success=true`，**真的建出工单 #32**（`source=chat`、`type=incident`、`priority=medium` 由矩阵推导） |
+| 效果账本 | `ticket_create#78d28908… status=succeeded attempts=1` |
+| 再次 `resume` | **没有第二张工单**（账本按 turn+action 去重） |
+| 审计 | `ticket.create success {tool, number=32, origin=agent, priority=medium}`；被去重那次记 `ticket.ticket_create deduplicated {idempotencyKey}` |
+
+**这次实测顺带纠正了两条我自己的说法**（都不影响代码，但影响你对该系统的认知）：
+
+1. `/ready` **不要求内部身份**（未鉴权返回 200）。它只暴露能力清单、不含数据，可以接受，
+   但与 `/metrics`（未鉴权 401）的严格程度不一致，值得知道。
+2. 你当前运行的 agent-service 是 `checkpoint_backend: memory`（`durable_checkpoints: false`），
+   虽然 `approval_store: postgres`。与本次改动无关，但意味着**重启后中断的审批无法 resume**。
+
+### 25.5 仍未做（诚实清单）
+
+- **`heartbeat()` 对 `TimeoutPolicy` 的实际效果未在真实图上验证**：单测确认事件按 10s
+  发出、`tick()` 在每轮开始与每轮工具完成后被调用，但"心跳是否真的刷新了节点空闲计时"
+  需要一次真实慢工具跑一遍才敢说成立。框架文档也提醒：**同步阻塞代码不会被超时按时
+  取消**，而 `retrieval/*` 里仍有同步 httpx 调用——这是设计文档自己点出的叠加问题，
+  本轮未解决。
+- **确认档位只在 agent-service 侧闭环**：Java 侧把它当普通审批记录（`rule_id` =
+  `WRITE-CONFIRMATION-REQUIRED`、`required_approver_roles=requester`），前端按钮已放开，
+  但**没有在界面上把"这是写操作确认"与"这是高风险审批"显式区分**（只有文案差异）。
+- **一次确认只覆盖一轮的写**：模型在确认后又提出新的写调用时会再次暂停（每次都要点头）。
+  没有"本次会话内记住"的选项，也没有批量确认。
+- **并发重复投递仍不是严格一次**：idempotency 是"事后记录"而非预留，两个同时到达的
+  相同 key 都会执行，第二个的插入失败（`ON CONFLICT DO NOTHING` 返回 0）。这个缺口与
+  写重试策略绑定（只在连接未建立时重写），因此有界，但没有消除；严格一次需要预留式
+  begin/commit。
+- **熔断状态是进程内的**：多副本各自计数、各自冷却；`/ready` 显示的是"这个副本"。
+- **租约判定用库的时钟**，因此要求 agent-service 与 PostgreSQL 的时间可信且相对一致
+  （同机或 NTP 同步）。没有做时钟漂移检测。
+- **循环内的 token 估算粒度是"整段 messages"**：每轮重新估算而不是增量，轮数多时估算
+  偏大 → 更早停。方向安全（宁早停不超支），但不精确。
+- **`tool_result_max_tokens` 的默认 1500 是拍的**：没有基于"模型实际需要多少工具结果"
+  的评测。
+- **未做故障注入**：租约与重试的证据来自单测 +（真实 SQL 的）租约 CAS 与两进程并发抢占，
+  但**没有真的杀进程或断网**。"取消时不写 failed"这条只有单测覆盖。
+- **跨服务去重只验证了"事后重放"**：同 key 串行两次到达只建一张单已验证；**并发**两个相同
+  key 仍会都执行（第二个插入失败）。这与写重试策略绑定（只在连接未建立时重写），因此有界，
+  未消除。
+- **心跳对 `TimeoutPolicy` 的实际效果未验证**：事件按节奏发出、`tick()` 被调用都有单测，
+  但"心跳真的刷新了节点空闲计时"需要一次真实慢工具（≥ 25s）跑一遍。本轮所有工具都秒级返回。
+- **验证过程在开发库里留下了测试数据**：工单 #29–#32（标题含「DSH 幂等验证」的是幂等验证，
+  「打印机坏了」的是真实会话），以及若干 `effect_ledger` / `agent_tool_idempotency` 已清理后
+  新增的行。临时账号都已停用（`status=disabled`）。要清掉可以按标题删除或留着当样例。
+
+
 
 
 

@@ -9,7 +9,30 @@ thing to debug.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from typing import Any
+
+#: The idempotency key for the call currently being executed.
+#:
+#: Passed as a context variable rather than a parameter because the ledger mints it *after*
+#: the adapter is chosen (the key is derived from the effect that ran), and because a
+#: parameter would have to be threaded through every adapter and every test that calls one.
+#: The value is stable for the whole call, including retries, which is the property that
+#: makes it usable as a provider-side deduplication key.
+_idempotency_key: ContextVar[str | None] = ContextVar("tool_idempotency_key", default=None)
+
+
+def current_idempotency_key() -> str | None:
+    return _idempotency_key.get()
+
+
+def set_idempotency_key(value: str | None):
+    """Set the key for this call. Returns the token to reset with."""
+    return _idempotency_key.set((value or "").strip() or None)
+
+
+def reset_idempotency_key(token) -> None:
+    _idempotency_key.reset(token)
 
 
 class ToolAdapter(ABC):

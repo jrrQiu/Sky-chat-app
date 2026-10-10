@@ -35,9 +35,18 @@ async def _event_generator(request: ChatRequest, graph=None):
                     timeout=settings.stream_idle_timeout_seconds,
                 )
             except asyncio.TimeoutError:
+                # One code and one message. This used to say "Agent service timed out" in
+                # English while the other timeout paths produced different wording, so a user
+                # could not tell "the turn stalled" from "the connection dropped". A write that
+                # was in flight has already emitted RESULT_UNKNOWN, which is the part a user
+                # must act on; this event only closes the turn.
                 error = {
                     "type": "error",
-                    "message": "Agent service timed out",
+                    "errorCode": "TURN_TIMEOUT",
+                    "message": (
+                        f"本次生成已有 {settings.stream_idle_timeout_seconds:.0f}s 没有进展，已终止。"
+                        "请重试；若刚才发生过写操作，请先确认结果再重试。"
+                    ),
                 }
                 await redis_stream.publish(f"run:{request.request_id}", error)
                 yield format_sse(error)

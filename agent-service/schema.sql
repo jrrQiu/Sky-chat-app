@@ -155,7 +155,13 @@ CREATE TABLE IF NOT EXISTS knowledge_document (
     expires_at TIMESTAMPTZ,
     status VARCHAR(16) NOT NULL DEFAULT 'active',
     allowed_roles JSONB NOT NULL DEFAULT '[]'::jsonb,
-    embedding vector(1536),
+    -- 1024 dims to match EMBEDDING_DIMENSION / the configured embedding model.
+    -- Changing this REQUIRES an explicit ALTER on existing deployments:
+    -- `CREATE TABLE IF NOT EXISTS` silently keeps the old width, and an HNSW
+    -- index is bound to the column's dimension, so it must be dropped and
+    -- rebuilt. Vectors from a different model must be cleared, not reused --
+    -- cosine similarity between them is meaningless and fails silently.
+    embedding vector(1024),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -170,7 +176,9 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
     section_path JSONB NOT NULL DEFAULT '[]'::jsonb,
     page INTEGER NOT NULL DEFAULT 1,
     token_count INTEGER NOT NULL DEFAULT 0,
-    embedding vector(1536),
+    -- See the note on knowledge_document.embedding: width is bound to the
+    -- configured embedding model, and the HNSW index is bound to the width.
+    embedding vector(1024),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

@@ -1,3 +1,4 @@
+from app.config import settings
 from app.retrieval.pipeline import run_retrieval
 
 
@@ -31,8 +32,19 @@ class FakeRerankClient:
 
 
 class FakeEmbeddingProvider:
+    """Returns vectors at the configured width.
+
+    The width matters now that persisted vectors are searched in pgvector: the query
+    vector is cast to `vector(N)`, and a mismatch (`expected 1024 dimensions`) makes
+    the store fall back, so a fake of the wrong width would silently stop exercising
+    the dense channel instead of failing loudly.
+    """
+
+    def __init__(self, dimensions: int | None = None) -> None:
+        self.dimensions = dimensions or settings.embedding_dimension
+
     def embed(self, text: str):
-        return [0.1] * 8
+        return [0.1] * self.dimensions
 
 
 def test_model_query_understanding_is_used_when_client_provided():
@@ -43,7 +55,14 @@ def test_model_query_understanding_is_used_when_client_provided():
 
     assert result.task_type == "policy_query"
     assert result.plan["kb_scopes"] == ["FINANCE_POLICY"]
-    assert [item["source_id"] for item in result.evidence] == ["POL-FINANCE-001"]
+    # Scoping still holds: only the routed knowledge base contributes. The document
+    # may now appear as several chunk-level evidence blocks rather than exactly one,
+    # because evidence is no longer collapsed to one block per document — see
+    # `test_retrieval_evidence_granularity.py`.
+    assert {item["source_id"] for item in result.evidence} == {"POL-FINANCE-001"}
+    assert len({item["metadata"]["chunk_id"] for item in result.evidence}) == len(
+        result.evidence
+    ), "each evidence block must cite a distinct chunk"
 
 
 def test_model_reranker_can_promote_policy_sop():

@@ -158,7 +158,14 @@ public class ApprovalService {
         if (existing == null) {
             return Decision.refused(null, Failure.NOT_FOUND);
         }
-        if (userId != null && userId.equals(existing.getUserId())) {
+        // Separation of duties, with exactly one exception: a write *confirmation*. That is not
+        // an approval of somebody else's request, it is the requester accepting responsibility
+        // for an action the agent wants to take in their name, so the person who asked is the
+        // right person to answer. The exception is carried in the data as the literal role
+        // `requester` rather than inferred from a blank field, so it is visible in the record
+        // and in the UI, and a blank field still means "no self-decision".
+        if (!isRequesterAnswered(existing.getRequiredApproverRoles())
+                && userId != null && userId.equals(existing.getUserId())) {
             return Decision.refused(existing, Failure.SELF_APPROVAL);
         }
         if (!hasRequiredRole(existing.getRequiredApproverRoles(), deciderRoles)) {
@@ -231,11 +238,32 @@ public class ApprovalService {
         if (required.isEmpty()) {
             return true;
         }
+        if (isRequesterAnswered(requiredApproverRoles)) {
+            // `requester` is not a role anybody holds; it is the marker that this decision
+            // belongs to the person who asked. The self-check above is what enforces it.
+            return required.size() == 1;
+        }
         Set<String> actual = parseRoles(joinRoles(deciderRoles));
         if (actual.contains(ADMIN_ROLE)) {
             return true;
         }
         return required.stream().anyMatch(actual::contains);
+    }
+
+    /**
+     * The literal marker meaning "the requester may answer this one".
+     *
+     * <p>Used only for write confirmations: an agent that wants to create a ticket in the
+     * user's name asks that user, not a separate approver. Spelling it out — instead of leaving
+     * {@code required_approver_roles} empty, which also passes — keeps the exception visible in
+     * the approval record and lets the UI explain why the button is enabled for the requester
+     * and disabled for everyone else.</p>
+     */
+    public static final String REQUESTER_ROLE = "requester";
+
+    public static boolean isRequesterAnswered(String requiredApproverRoles) {
+        Set<String> required = parseRoles(requiredApproverRoles);
+        return required.contains(REQUESTER_ROLE);
     }
 
     private static Set<String> parseRoles(String csv) {

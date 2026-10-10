@@ -22,8 +22,21 @@ import {
   ApprovalDecisionTrailHeader,
 } from '@/features/approvals/components/ApprovalDecisionTrail'
 import { useApprovalStore } from '@/features/approvals/store/approval.store'
-import type { ApprovalTask } from '@/features/approvals/types'
+import type { ApprovalDecision, ApprovalTask } from '@/features/approvals/types'
 import { useAuthStore } from '@/features/auth/store/auth.store'
+
+/**
+ * 稳定的空数组常量。
+ *
+ * 不要在 selector 里写 `?? []`：Zustand v5 直接把 selector 交给 `useSyncExternalStore`，
+ * React 用 `Object.is` 比较快照，而每次调用新建的 `[]` 都不相等 —— React 会认为 store
+ * 一直在变，于是报 "The result of getSnapshot should be cached to avoid an infinite loop"
+ * 并无限重渲染。审批详情弹窗此前就是这样崩掉的：打开任意一条还没有决策记录的审批即触发。
+ *
+ * 正确的形状是「selector 返回 store 里的原始引用（可能是 undefined），兜底放在外面」，
+ * 这样未命中时返回的始终是同一个引用。
+ */
+const NO_DECISIONS: ApprovalDecision[] = []
 
 interface ApprovalDetailDialogProps {
   approval: ApprovalTask | null
@@ -61,8 +74,9 @@ export function ApprovalDetailDialog({
   onDecide,
 }: ApprovalDetailDialogProps) {
   const user = useAuthStore((state) => state.user)
+  // 返回原始引用（未加载时为 undefined），兜底放在 selector 之外 —— 见 NO_DECISIONS 的说明。
   const decisions = useApprovalStore((state) =>
-    approval ? (state.decisions[approval.id] ?? []) : []
+    approval ? state.decisions[approval.id] : undefined
   )
   const decisionsLoading = useApprovalStore((state) => state.decisionsLoading)
   const deciding = useApprovalStore((state) => state.deciding)
@@ -93,15 +107,24 @@ export function ApprovalDetailDialog({
     heldRoles.includes('admin') ||
     requiredRoles.some((role) => heldRoles.includes(role))
 
+  /**
+   * 「requester」是写操作确认专用的哨兵值：建单/公开评论需要的是**申请人本人**确认，
+   * 而不是另一个审批人。服务端对自审批的拒绝只在这一层放开（ApprovalService.decide
+   * 读到这个值才允许申请人自己决定），所以界面必须同步放开，否则用户会看到一个
+   * 永远点不动的按钮。
+   */
+  const requesterMayDecide = requiredRoles.includes('requester')
+  const roleSatisfied = hasRole || (requesterMayDecide && isRequester)
+
   const isPending = approval?.status === 'pending'
-  const canDecide = isPending && !isRequester && hasRole
+  const canDecide = isPending && roleSatisfied && (requesterMayDecide || !isRequester)
 
   // 成熟产品不会把按钮藏起来，而是说明为什么不能点。
   const blockedReason = !isPending
     ? '该申请已有结论'
-    : isRequester
+    : isRequester && !requesterMayDecide
       ? '不能审批自己发起的申请'
-      : !hasRole
+      : !roleSatisfied
         ? `需要以下角色之一：${requiredRoles.join(' / ')}`
         : null
 
@@ -181,7 +204,10 @@ export function ApprovalDetailDialog({
 
             <div className="mt-5">
               <ApprovalDecisionTrailHeader />
-              <ApprovalDecisionTrail decisions={decisions} loading={decisionsLoading} />
+              <ApprovalDecisionTrail
+                decisions={decisions ?? NO_DECISIONS}
+                loading={decisionsLoading}
+              />
             </div>
 
             {canDecide && (

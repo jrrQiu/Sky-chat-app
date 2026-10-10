@@ -139,6 +139,19 @@ CREATE TABLE IF NOT EXISTS conversation_summary (
     PRIMARY KEY (conversation_id, version)
 );
 
+-- Rolling-summary coverage (Context Engine v2). `covered_*` delimit the range of
+-- messages this version summarises, so consecutive versions cover the
+-- conversation with no gap and no overlap; `field_values` keeps the structured
+-- form the next prompt is rebuilt from. `CREATE TABLE IF NOT EXISTS` never evolves
+-- an existing table, so each column needs its own guarded ALTER (the drift check
+-- compares the DDL against information_schema).
+ALTER TABLE conversation_summary
+    ADD COLUMN IF NOT EXISTS covered_from_message_id VARCHAR(64) NULL;
+ALTER TABLE conversation_summary
+    ADD COLUMN IF NOT EXISTS covered_until_message_id VARCHAR(64) NULL;
+ALTER TABLE conversation_summary
+    ADD COLUMN IF NOT EXISTS field_values JSONB NOT NULL DEFAULT '{}'::jsonb;
+
 CREATE TABLE IF NOT EXISTS memory (
     id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(64) NOT NULL,
@@ -154,6 +167,28 @@ CREATE INDEX IF NOT EXISTS idx_summary_conversation
     ON conversation_summary(conversation_id, version DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_user
     ON memory(user_id, kind);
+
+-- Cross-service idempotency for agent tool writes (T3).
+--
+-- The agent service's effect ledger makes a *replay* safe inside Python. It cannot make a
+-- retried HTTP delivery safe, because the second request arrives here looking exactly like
+-- a new one. So the ledger's provider key travels on the `Idempotency-Key` header, and this
+-- table is what turns "the same key again" into "the same answer as before" instead of a
+-- second ticket.
+--
+-- `response` is stored so a duplicate returns the *original* result -- including the ticket
+-- number -- rather than a cached "already done" with nothing in it: the model needs the same
+-- thing the first call returned, or it will invent the difference.
+CREATE TABLE IF NOT EXISTS agent_tool_idempotency (
+    tool_name   VARCHAR(64) NOT NULL,
+    idem_key    VARCHAR(128) NOT NULL,
+    response    JSONB NOT NULL,
+    actor_id    VARCHAR(64) NULL,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tool_name, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tool_idem_created
+    ON agent_tool_idempotency(created_at);
 
 -- Approval decision trail: one immutable row per accepted decision, so the
 -- approval_task row keeps only the latest state.

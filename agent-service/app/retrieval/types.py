@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, Sequence
 
 from app.knowledge.models import (
     KnowledgeBase,
@@ -16,6 +16,26 @@ from app.knowledge.models import (
 # unconfigured deployment gets instead of a fake semantic channel.
 RETRIEVAL_MODE_HYBRID = "hybrid"
 RETRIEVAL_MODE_LEXICAL_ONLY = "lexical_only"
+
+
+class DenseStoreLike(Protocol):
+    """Structural type for a dense backend, so callers do not import the store.
+
+    `app.retrieval.vector_store` imports `types` (for `ScoredItem`); annotating the
+    store here as a Protocol keeps the dependency one-directional.
+    """
+
+    backend: str
+
+    def search_dense(
+        self,
+        query: str,
+        *,
+        allowed_chunk_ids: set[str] | None,
+        top_k: int,
+        provider: Any,
+    ) -> Sequence["ScoredItem"]:
+        ...
 
 
 @dataclass

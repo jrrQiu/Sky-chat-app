@@ -5,21 +5,22 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.skychat.domain.Conversation;
 import com.skychat.domain.Message;
 import com.skychat.dto.ChatStreamRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class ChatStreamService {
+    private static final Logger log = LoggerFactory.getLogger(ChatStreamService.class);
+
     private final AgentGatewayClient agentGatewayClient;
     private final MessageService messageService;
     private final ConversationService conversationService;
@@ -85,9 +86,10 @@ public class ChatStreamService {
                     latestUserMessage
             );
 
-            AtomicReference<String> assistantText = new AtomicReference<>("");
-            AtomicReference<String> title = new AtomicReference<>("");
-            AtomicBoolean failed = new AtomicBoolean(false);
+            // One accumulator per stream: it is the single place that reads the
+            // agent service's event types, so the protocol rules live in one
+            // testable class instead of in this lambda.
+            StreamEventAccumulator accumulator = new StreamEventAccumulator(objectMapper);
 
             String finalConversationId = resolvedConversationId;
             Map<String, Object> agentPayload = buildAgentPayload(
@@ -104,7 +106,7 @@ public class ChatStreamService {
                     .map(event -> {
                         String data = event.data() == null ? "" : event.data();
                         int seq = runEventStore.append(runId, data);
-                        accumulateEvent(data, assistantText, title, failed);
+                        accumulator.accept(data);
                         // Runs on boundedElastic, so blocking JDBC ingestion is acceptable.
                         approvalIngestService.record(
                                 userId,
@@ -122,12 +124,10 @@ public class ChatStreamService {
                         persistAssistantTurn(
                                 userId,
                                 finalConversationId,
-                                assistantText.get(),
-                                title.get()
+                                accumulator.assistantText(),
+                                accumulator.title()
                         );
-                        Mono.fromRunnable(() -> conversationSummaryService.roll(finalConversationId))
-                                .subscribeOn(Schedulers.boundedElastic())
-                                .subscribe();
+                        persistContextReport(finalConversationId, accumulator.contextReport());
                     })
                     .onErrorResume(error -> {
                         String message = safeErrorMessage(error);
@@ -135,8 +135,8 @@ public class ChatStreamService {
                         persistAssistantTurn(
                                 userId,
                                 finalConversationId,
-                                assistantText.get(),
-                                title.get()
+                                accumulator.assistantText(),
+                                accumulator.title()
                         );
                         return Flux.just(createErrorEvent(message));
                     })
@@ -217,24 +217,37 @@ public class ChatStreamService {
         return "";
     }
 
-    private void accumulateEvent(
-            String data,
-            AtomicReference<String> assistantText,
-            AtomicReference<String> title,
-            AtomicBoolean failed
-    ) {
+    /**
+     * Persist what the context engine did with this turn.
+     *
+     * <p>The rolling summary is written here rather than by a separate per-turn job
+     * because the evicted range ends at the reply the engine just produced; a
+     * separate job would have to guess the range, which is how a summary and the
+     * originals end up overlapping or leaving a gap. Failures are logged and never
+     * propagated: the answer has already been streamed successfully.
+     */
+    private void persistContextReport(String conversationId, JsonNode report) {
+        if (report == null || report.isNull() || conversationId == null) {
+            return;
+        }
         try {
-            JsonNode event = objectMapper.readTree(data);
-            String type = event.path("type").asText();
-            if ("answer".equals(type) && event.has("content")) {
-                assistantText.set(assistantText.get() + event.get("content").asText());
-            } else if ("conversation_title".equals(type) && event.has("content")) {
-                title.set(event.get("content").asText());
-            } else if ("error".equals(type)) {
-                failed.set(true);
+            JsonNode delta = report.path("summary_delta");
+            if (!delta.isMissingNode() && !delta.isNull()) {
+                conversationSummaryService.persistRolling(conversationId, delta);
             }
-        } catch (Exception ignored) {
-            // Non-JSON events do not affect answer persistence.
+            // Structured diagnostics for "why did the model not know that": the
+            // numbers are per turn, so a support engineer can reconstruct the
+            // prompt's shape without the prompt itself.
+            log.debug(
+                    "context_report conversation={} used={}/{} droppedMessages={} droppedEvidence={}",
+                    conversationId,
+                    report.path("used_tokens").asInt(0),
+                    report.path("usable_tokens").asInt(0),
+                    report.path("messages").path("dropped").asInt(0),
+                    report.path("evidence").path("dropped").asInt(0)
+            );
+        } catch (RuntimeException error) {
+            log.warn("Could not persist the context report for {}", conversationId, error);
         }
     }
 

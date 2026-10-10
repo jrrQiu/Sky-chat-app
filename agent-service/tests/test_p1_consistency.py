@@ -31,6 +31,10 @@ class StubProvider:
 
 
 def test_intent_classifier_is_unavailable_without_a_provider(monkeypatch):
+    # Must be explicit: a developer who has configured EMBEDDING_API_KEY in `.env`
+    # would otherwise get a real provider resolved from configuration, and this test
+    # would be asserting about a state it never actually created.
+    monkeypatch.setattr(settings, "embedding_api_key", "")
     monkeypatch.setattr(settings, "allow_hash_embeddings", False)
     classifier = SemanticIntentClassifier(provider=None)
 
@@ -110,6 +114,15 @@ class _FakeCursor:
         self.executed = 0
 
     def execute(self, *_args, **_kwargs) -> None:
+        self.executed += 1
+
+    def fetchall(self):
+        # `seed` now reads the pre-existing chunk contents first, so it can skip
+        # re-embedding text that did not change. An empty pre-state is a valid
+        # answer: every chunk is new.
+        return []
+
+    def executemany(self, *_args, **_kwargs) -> None:
         self.executed += 1
 
     def __enter__(self):

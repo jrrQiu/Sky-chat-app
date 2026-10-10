@@ -35,8 +35,19 @@ QUERY = "VPN 外网访问财务系统需要哪些审批和条件？"
 
 
 class FakeEmbeddingProvider:
+    """Vectors at the configured width.
+
+    The width is load-bearing once persisted vectors are searched in pgvector: the
+    query vector is cast to `vector(N)`, and a mismatch (`expected 1024 dimensions`)
+    makes the store fall back to lexical. A wrong-width fake would therefore stop
+    exercising the dense channel while still passing a "hybrid" assertion by luck.
+    """
+
+    def __init__(self, dimensions: int | None = None) -> None:
+        self.dimensions = dimensions or settings.embedding_dimension
+
     def embed(self, text: str) -> list[float]:
-        return [0.1] * 8
+        return [0.1] * self.dimensions
 
 
 class DeadEmbeddingProvider:
@@ -114,7 +125,11 @@ def test_retrieval_is_lexical_only_and_says_so(no_dense_configuration):
     ), "no result may claim a dense match when no dense channel ran"
 
 
-def test_retrieval_is_hybrid_when_a_dense_provider_is_supplied():
+def test_retrieval_is_hybrid_when_a_dense_provider_is_supplied(no_dense_configuration):
+    # Pinned to the in-memory backend. With RETRIEVAL_USE_LLM enabled in a
+    # developer's `.env` the dense channel would instead be served by pgvector,
+    # which needs a populated store; the test environment has no database, so the
+    # assertion would depend on ambient configuration rather than on this code.
     result = run_retrieval(QUERY, embedding_provider=FakeEmbeddingProvider())
 
     assert result.retrieval_mode == RETRIEVAL_MODE_HYBRID

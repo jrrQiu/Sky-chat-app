@@ -70,7 +70,11 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     deepseek_model: str = "deepseek-chat"
     llm_timeout_seconds: float = 60.0
-    stream_idle_timeout_seconds: float = 30.0
+    # The stream's idle window is the *outermost* of the three time budgets and must be
+    # strictly larger than the node idle window, which is in turn larger than a single
+    # tool's timeout. When they were all 30s, a legitimate 25-30s tool looked like a hung
+    # stream and the turn was killed mid-execution.
+    stream_idle_timeout_seconds: float = 120.0
 
     # Which adapter serves tools the ticket adapter does not implement. `openapi` POSTs to
     # `tool_base_url`; anything else refuses, because the mock provider that used to answer here
@@ -86,6 +90,10 @@ class Settings(BaseSettings):
     # fallback. Requires a model API key; `/ready` reports which mode is actually in
     # effect under `tools.routing`, so the two are not confused.
     function_calling_enabled: bool = True
+    #: Model used for the tool-selection turns. Empty means "the same model as the answer",
+    #: which is the default because a deployment that reasons with one model and decides
+    #: with another is a configuration nobody expects.
+    function_calling_model: str = ""
     # The agent loop is bounded. An agent that can keep calling tools needs a ceiling on
     # rounds and on total calls, or a confused model turns into an unbounded bill --
     # and, with real writes, into repeated effects.
@@ -100,6 +108,54 @@ class Settings(BaseSettings):
     # Stream the tool *decision* so the user sees the reasoning as it happens instead of a
     # generic "thinking" line. Costs one streaming request per round.
     agent_stream_decisions: bool = True
+
+    # --- tool resilience (retry / circuit breaker / time budget) -----------
+    # T1/T2: retries are bounded per call *and* in total, so "each call retries twice"
+    # cannot add up to an unbounded round. `is_safe_to_retry` decides whether a given
+    # exception may be retried at all, and is kept semantically identical to the Java
+    # `AgentCircuitBreaker.isSafeToRetry`.
+    tool_retry_read_attempts: int = 3  # total attempts (1 initial + 2 retries)
+    tool_retry_write_attempts: int = 2  # writes retry only when the request never landed
+    tool_retry_initial_backoff_seconds: float = 0.2
+    tool_retry_backoff_factor: float = 3.0
+    tool_retry_max_backoff_seconds: float = 2.0
+    tool_retry_jitter: float = 0.25
+    #: Ceiling on the whole retry budget for one call, including the waits.
+    tool_retry_total_budget_seconds: float = 8.0
+    #: Hard wall-clock cap for ONE tool call, retries included, enforced with `asyncio.wait_for`
+    #: around the invocation. httpx's own timeout is per operation and its read timeout measures
+    #: the gap *between* reads, so a dependency that drips a byte every few seconds would never
+    #: time out and could hold the node for its entire run budget.
+    #:
+    #: It must stay **below `effect_lease_seconds`**: a write that is still running when its
+    #: lease expires can be taken over by a replay and executed twice, which is exactly what the
+    #: lease exists to prevent. `EffectLedger.lease_seconds` derives its floor from this value.
+    tool_call_deadline_seconds: float = 45.0
+    #: Per-tool circuit breaker: consecutive transport failures before the breaker opens.
+    tool_circuit_failure_threshold: int = 3
+    tool_circuit_cooldown_seconds: float = 30.0
+    #: Heartbeat cadence while a tool runs. Keeps the node/stream idle windows alive and
+    #: gives the client something to show instead of a frozen "thinking" line.
+    tool_heartbeat_seconds: float = 10.0
+    #: Node-level idle window. Must sit between one tool's timeout and the stream's.
+    node_idle_timeout_seconds: float = 60.0
+
+    # --- effect ledger lease (T4) ------------------------------------------
+    #: How long a `started` row is trusted to mean "someone is working on it". Derived from
+    #: the tool timeout so a legitimately long call is not mistaken for a crash, and a
+    #: replayed turn after a real crash can eventually take over.
+    effect_lease_seconds: float = 90.0
+    #: When true, a live lease makes a replay return EFFECT_IN_PROGRESS instead of running.
+    effect_lease_enabled: bool = True
+
+    # --- write authorisation tiers (T7) ------------------------------------
+    #: Tools whose `write_policy` is `confirm` pause the graph for one user confirmation
+    #: before executing. Off means the confirm tier degrades to `direct`, which `/ready`
+    #: reports, so "the agent can create tickets silently" is never an accident.
+    write_confirmation_enabled: bool = True
+    #: Tokens allowed for one tool result before it is trimmed for the model. The full text
+    #: stays in the emitted event, so "what the tool said" is still auditable.
+    tool_result_max_tokens: int = 1500
     # When an approved high-risk action has no integrated target system, register the
     # approved work as a change ticket in our own system of record. The external action
     # still reports as not executed; this only ensures the approval leaves a trace.
@@ -122,9 +178,56 @@ class Settings(BaseSettings):
     # worse than lexical-only. Opt-in for offline development and tests only; the
     # service otherwise runs (and reports) lexical-only retrieval.
     allow_hash_embeddings: bool = False
-    model_context_window: int = 8192
-    output_reserve: int = 1024
+    # Texts per `/embeddings` request. One request per chunk was the old shape: an
+    # N+1 round-trip pattern on every query. Providers accept far more than this;
+    # 64 keeps a single request small enough to retry cheaply.
+    embedding_batch_size: int = 64
+    # Embeddings are content-addressed and cached, so a repeated query or an
+    # unchanged document costs nothing. The key includes the model name and
+    # dimension, because reusing vectors across models would silently corrupt
+    # ranking rather than error.
+    embedding_cache_enabled: bool = True
+    embedding_cache_size: int = 4096
+
+    # --- dense retrieval storage -----------------------------------------
+    # Chunk vectors are written to `knowledge_chunk.embedding` (pgvector) at
+    # ingest and searched with an HNSW index. With this off, or with no
+    # database, the dense channel falls back to scanning the in-process index —
+    # correct but O(n) per query, and the reason `/ready` reports the backend.
+    vector_store_enabled: bool = True
+    # HNSW build/query parameters. `ef_search` is set per query; a higher value
+    # trades latency for recall.
+    vector_hnsw_m: int = 16
+    vector_hnsw_ef_construction: int = 64
+    vector_hnsw_ef_search: int = 40
+    # Prompt budget for one policy evidence block. A matched chunk is expanded with
+    # its siblings so a qualifying clause in the next sentence is not lost, and cut
+    # here so a hit inside a long policy cannot push out every other source.
+    retrieval_evidence_max_tokens: int = 320
+    # Per-document cap on evidence blocks. Without it one verbose policy can occupy
+    # the whole context window, which is the "no dedup" anti-pattern.
+    retrieval_evidence_per_document: int = 3
+
+    # --- context engine ---------------------------------------------------
+    # The window and the reserved output are **not** configured here any more:
+    # they come from `app/context/model_specs.py`, so the budget and the
+    # `max_tokens` actually sent to the provider cannot drift apart. These two
+    # remain as explicit overrides for an operator who must pin a value without a
+    # code change (0 = use the model spec).
+    model_context_window: int = 0
+    output_reserve: int = 0
+    # Head-room for the tokenizer's approximation of the provider's tokenizer and
+    # for protocol overhead. Applied to every request.
     context_safety_margin: int = 256
+    # When false the engine evicts without summarising: report still records every
+    # drop, so the loss is measurable rather than invisible.
+    context_summary_enabled: bool = True
+    # Shadow mode plans the prompt with the new engine and reports the decisions
+    # but keeps serving the recorded prompt. For rollout comparison.
+    context_shadow_mode: bool = False
+    # A model the vendor no longer publishes a spec for is either refused (true)
+    # or served with the conservative default spec and reported as `known: false`.
+    strict_model_allowlist: bool = False
 
     redis_url: str = "redis://localhost:6379/0"
     # A down Redis must not add seconds of latency to every streamed event; the
@@ -169,6 +272,25 @@ class Settings(BaseSettings):
         return bool(self.database_url) and (
             self.strict_persistence or self.checkpoint_backend == "postgres"
         )
+
+    def effective_context_limits(self, model: str | None) -> tuple[int, int]:
+        """``(context_window, max_output)`` for one model.
+
+        Single source for both numbers: the budget subtracts the second from the
+        first, and the same second value is sent as ``max_tokens``. `.env` values
+        act as overrides; ``0`` means "use the model spec".
+        """
+        from app.context.model_specs import model_spec
+
+        spec = model_spec(model)
+        window = self.model_context_window or spec.context_window
+        max_output = self.output_reserve or spec.default_max_output
+        # An inverted pair would make the usable budget negative and every
+        # request infeasible, so it is clamped here rather than left to fail deep
+        # inside the planner.
+        if max_output >= window:
+            max_output = max(1, window // 2)
+        return int(window), int(max_output)
 
 
 @lru_cache

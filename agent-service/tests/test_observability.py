@@ -508,7 +508,21 @@ def test_stream_completion_records_provider_usage(monkeypatch):
 
     chunks = asyncio.run(scenario())
 
-    assert chunks == [("answer", "你好")]
+    # The provider's `usage` is now its own frame instead of being swallowed in a
+    # `finally` block, because the context engine calibrates its token estimate
+    # against it. A consumer that ignores the frame would append `None` to the
+    # answer, so the contract is asserted explicitly.
+    assert chunks == [
+        ("answer", "你好"),
+        (
+            "usage",
+            {
+                "prompt_tokens": 800,
+                "completion_tokens": 40,
+                "prompt_tokens_details": {"cached_tokens": 768},
+            },
+        ),
+    ]
     assert (
         local.counter_value(METRIC_TOKENS, model="deepseek-flash", kind="input") == 800.0
     )

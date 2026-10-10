@@ -7,6 +7,7 @@ import com.skychat.service.AuditService;
 import com.skychat.service.AuthException;
 import com.skychat.service.InternalTokenService;
 import com.skychat.service.TicketService;
+import com.skychat.service.ToolIdempotencyService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -58,22 +59,26 @@ public class InternalToolController {
     private final TicketService ticketService;
     private final AuditService auditService;
     private final ClientAddressResolver clientAddressResolver;
+    private final ToolIdempotencyService toolIdempotencyService;
 
     public InternalToolController(
             InternalTokenService internalTokenService,
             TicketService ticketService,
             AuditService auditService,
-            ClientAddressResolver clientAddressResolver
+            ClientAddressResolver clientAddressResolver,
+            ToolIdempotencyService toolIdempotencyService
     ) {
         this.internalTokenService = internalTokenService;
         this.ticketService = ticketService;
         this.auditService = auditService;
         this.clientAddressResolver = clientAddressResolver;
+        this.toolIdempotencyService = toolIdempotencyService;
     }
 
     @PostMapping("/{toolName}")
     public Mono<ResponseEntity<Object>> invoke(
             @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
             @PathVariable String toolName,
             @RequestBody(required = false) Map<String, Object> body,
             ServerWebExchange exchange
@@ -92,7 +97,9 @@ public class InternalToolController {
         }
 
         Map<String, Object> args = unwrapArgs(body);
-        return Mono.fromCallable(() -> invokeTool(toolName, args, caller, exchange))
+        return Mono.fromCallable(
+                        () -> invokeTool(toolName, args, caller, exchange, idempotencyKey)
+                )
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
@@ -117,17 +124,36 @@ public class InternalToolController {
             String toolName,
             Map<String, Object> args,
             InternalTokenService.AgentCaller caller,
-            ServerWebExchange exchange
+            ServerWebExchange exchange,
+            String idempotencyKey
     ) {
         TicketService.Caller actor = new TicketService.Caller(caller.userId(), caller.roles());
+
+        // T3: a repeated delivery of the same write returns the original answer instead of
+        // repeating the effect. This has to happen before the switch, so no tool can forget it.
+        Map<String, Object> replay = toolIdempotencyService.replay(toolName, idempotencyKey);
+        if (replay != null) {
+            log.info(
+                    "Replayed tool {} for user {} under idempotency key {}",
+                    toolName, caller.userId(), idempotencyKey
+            );
+            audit(caller.userId(), "ticket." + toolName, "idempotent", "deduplicated", exchange, Map.of(
+                    "origin", "agent",
+                    "tool", toolName,
+                    "idempotencyKey", idempotencyKey
+            ));
+            return ok(replay);
+        }
+
+        ResponseEntity<Object> response;
         try {
-            return switch (toolName) {
+            response = switch (toolName) {
                 case "ticket_create" -> ticketCreate(actor, args, caller, exchange);
                 case "ticket_get" -> ticketGet(actor, args);
                 case "ticket_list" -> ticketList(actor, args);
                 case "ticket_comment" -> ticketComment(actor, args, caller, exchange);
                 case "ticket_merge" -> ticketMerge(actor, args, caller, exchange);
-                default -> ok(failure("未知工具：" + toolName));
+                default -> ok(failure("未知工具：" + toolName, "TOOL_NOT_IMPLEMENTED"));
             };
         } catch (AuthException error) {
             // A refusal the user should hear about, not an integration fault.
@@ -137,6 +163,28 @@ public class InternalToolController {
             );
             return ok(failure(error.getMessage(), error.code()));
         }
+        recordIdempotentResult(toolName, idempotencyKey, caller.userId(), response);
+        return response;
+    }
+
+    /** Store a successful result so a duplicate delivery can be answered from it. */
+    private void recordIdempotentResult(
+            String toolName,
+            String idempotencyKey,
+            String actorId,
+            ResponseEntity<Object> response
+    ) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return;
+        }
+        if (!(response.getBody() instanceof Map<?, ?> body)) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        body.forEach((key, value) -> payload.put(String.valueOf(key), value));
+        // Only successes are recorded, and only for tools whose repeated delivery would
+        // change something. Caching a failure would make a transient error permanent.
+        toolIdempotencyService.record(toolName, idempotencyKey, payload, actorId);
     }
 
     private ResponseEntity<Object> ticketCreate(
@@ -181,7 +229,7 @@ public class InternalToolController {
     ) {
         String id = resolveTicketId(actor, args);
         if (id == null) {
-            return ok(failure("需要提供 ticketId 或 number"));
+            return ok(failure("需要提供 ticketId 或 number", "TOOL_ARGUMENTS_MISSING"));
         }
         TicketDetail detail = ticketService.get(actor, id);
         return ok(success(describe(detail), ticketData(detail)));
@@ -228,7 +276,7 @@ public class InternalToolController {
     ) {
         String id = resolveTicketId(actor, args);
         if (id == null) {
-            return ok(failure("需要提供 ticketId 或 number"));
+            return ok(failure("需要提供 ticketId 或 number", "TOOL_ARGUMENTS_MISSING"));
         }
         TicketDetail updated = ticketService.addComment(
                 actor,

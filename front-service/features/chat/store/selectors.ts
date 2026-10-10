@@ -8,7 +8,10 @@ import type { MessagePhase, ActiveTool } from '../types/message-state'
 
 // 定义 Store 状态类型（避免循环依赖）
 interface ChatStoreState {
-  messageStates: Map<string, { phase: MessagePhase; activeTools: Map<string, ActiveTool> }>
+  messageStates: Map<
+    string,
+    { phase: MessagePhase; activeTools: Map<string, ActiveTool>; errorMessage?: string }
+  >
 }
 
 /** 阶段显示标签 */
@@ -64,4 +67,16 @@ export const selectHasRunningTools = (messageId: string) =>
     const msgState = state.messageStates.get(messageId)
     if (!msgState) return false
     return Array.from(msgState.activeTools.values()).some(t => t.state === 'running')
+  }
+
+/**
+ * 获取错误阶段带的服务端说明
+ *
+ * 界面用它替代固定的"生成失败"：服务端的文案里通常写着下一步该做什么
+ * （"请重试；若刚才发生过写操作，请先确认结果再重试"）。没有时返回 undefined，
+ * 由调用方回退到通用文案。
+ */
+export const selectMessageError = (messageId: string) =>
+  (state: ChatStoreState): string | undefined => {
+    return state.messageStates.get(messageId)?.errorMessage || undefined
   }

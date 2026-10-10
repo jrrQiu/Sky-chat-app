@@ -14,7 +14,7 @@ that has no verified entry.
 
 import json
 import time
-from typing import AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Mapping
 
 import httpx
 
@@ -61,9 +61,23 @@ async def stream_completion(
     api_key: str | None = None,
     system: str,
     temperature: float = 0.6,
-) -> AsyncIterator[tuple[str, str]]:
+    max_tokens: int | None = None,
+) -> AsyncIterator[tuple[str, str | dict[str, Any] | None]]:
+    """Stream one answer.
+
+    Yields ``(event_type, payload)`` where the type is ``answer``, ``reasoning`` or
+    ``usage``. **The ``usage`` frame must be handled by the consumer**: it is the
+    provider's own token count, and it is the only trustworthy measurement for
+    calibrating the context budget. A consumer that treats every frame as text will
+    append a JSON object to the answer (which is why this is a documented event
+    rather than a silent side channel).
+    """
     selected_model = model or settings.deepseek_model
     resolved_api_key = api_key or settings.deepseek_api_key
+    # `max_tokens` and the context budget come from the same resolution, so the
+    # input budget is never computed against a ceiling the request does not
+    # enforce. When the caller does not pass one, the model spec decides.
+    resolved_max_tokens = max_tokens or settings.effective_context_limits(selected_model)[1]
 
     if not resolved_api_key:
         # The local rule-based path is not a model call, so it is not counted as
@@ -92,6 +106,9 @@ async def stream_completion(
                     ],
                     "temperature": temperature,
                     "stream": True,
+                    # The output cap is enforced by the provider, not just reserved
+                    # in our arithmetic.
+                    "max_tokens": resolved_max_tokens,
                     # Ask DeepSeek for a final usage frame; without this a
                     # streamed call reports no tokens at all.
                     "stream_options": {"include_usage": True},
@@ -132,6 +149,11 @@ async def stream_completion(
                     text = delta.get("content")
                     if text:
                         yield ("answer", str(text))
+
+        # Emit the provider's own measurement as its own frame, so the caller can
+        # calibrate the budget against reality. `None` when the provider did not
+        # report usage -- "not reported" and "zero tokens" must not look alike.
+        yield ("usage", dict(usage) if usage else None)
     except httpx.TimeoutException as exc:
         outcome = "timeout"
         raise RuntimeError("模型服务调用超时") from exc

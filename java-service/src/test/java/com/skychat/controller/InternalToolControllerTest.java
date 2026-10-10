@@ -13,6 +13,8 @@ import com.skychat.service.AuthException;
 import com.skychat.service.InternalTokenService;
 import com.skychat.service.JwtSigner;
 import com.skychat.service.TicketService;
+import com.skychat.service.ToolIdempotencyService;
+import com.skychat.support.InMemoryAgentToolIdempotencyMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -40,6 +42,7 @@ class InternalToolControllerTest {
     private InternalTokenService tokens;
     private FakeTicketService tickets;
     private FakeAuditService audits;
+    private InMemoryAgentToolIdempotencyMapper idempotencyRows;
     private InternalToolController controller;
 
     @BeforeEach
@@ -47,8 +50,13 @@ class InternalToolControllerTest {
         tokens = new InternalTokenService(new AgentInternalProperties(SECRET, null), signer);
         tickets = new FakeTicketService();
         audits = new FakeAuditService();
+        idempotencyRows = new InMemoryAgentToolIdempotencyMapper();
         controller = new InternalToolController(
-                tokens, tickets, audits, new ClientAddressResolver(null)
+                tokens,
+                tickets,
+                audits,
+                new ClientAddressResolver(null),
+                new ToolIdempotencyService(idempotencyRows, new ObjectMapper())
         );
     }
 
@@ -60,6 +68,15 @@ class InternalToolControllerTest {
     }
 
     private ResponseEntity<Object> invoke(String token, String tool, Map<String, Object> body) {
+        return invoke(token, tool, body, null);
+    }
+
+    private ResponseEntity<Object> invoke(
+            String token,
+            String tool,
+            Map<String, Object> body,
+            String idempotencyKey
+    ) {
         MockServerHttpRequest.BaseBuilder<?> request = MockServerHttpRequest.post("/v1/internal/tools/" + tool);
         if (token != null) {
             request = request.header("Authorization", "Bearer " + token);
@@ -67,6 +84,7 @@ class InternalToolControllerTest {
         return controller
                 .invoke(
                         token == null ? null : "Bearer " + token,
+                        idempotencyKey,
                         tool,
                         body,
                         MockServerWebExchange.from(request)
@@ -157,6 +175,85 @@ class InternalToolControllerTest {
         assertThat(bodyOf(response)).containsEntry("success", false);
         assertThat(String.valueOf(bodyOf(response).get("text"))).contains("未知工具");
         assertThat(tickets.lastCaller).isNull();
+    }
+
+    // ------------------------------------------------------- idempotency (T3)
+
+    @Test
+    @DisplayName("a repeated write under one idempotency key creates one ticket")
+    void repeatedDeliveryIsDeduplicated() {
+        tickets.detail = FakeTicketService.detail("t1", 1042, "incident", "new", "high", "打印机离线");
+        String token = callerToken("user-7", List.of("employee"));
+        Map<String, Object> body = Map.of("title", "打印机离线", "type", "incident");
+
+        ResponseEntity<Object> first = invoke(token, "ticket_create", body, "idem_delivery_1");
+        ResponseEntity<Object> second = invoke(token, "ticket_create", body, "idem_delivery_1");
+
+        // The second delivery is answered from the recorded result: same ticket number, marked
+        // as a replay, and the ticket service was not asked to create a second ticket.
+        assertThat(bodyOf(first)).containsEntry("success", true);
+        assertThat(bodyOf(second)).containsEntry("success", true);
+        assertThat(bodyOf(second)).containsEntry("deduplicated", true);
+        assertThat(String.valueOf(bodyOf(second).get("text")))
+                .isEqualTo(String.valueOf(bodyOf(first).get("text")));
+        assertThat(tickets.createCalls).isEqualTo(1);
+        assertThat(audits.actions).contains("ticket.ticket_create");
+    }
+
+    @Test
+    @DisplayName("different idempotency keys are different operations")
+    void differentKeysBothCreate() {
+        tickets.detail = FakeTicketService.detail("t1", 1042, "incident", "new", "high", "打印机离线");
+        String token = callerToken("user-7", List.of("employee"));
+        Map<String, Object> body = Map.of("title", "打印机离线");
+
+        invoke(token, "ticket_create", body, "idem_a");
+        invoke(token, "ticket_create", body, "idem_b");
+
+        assertThat(tickets.createCalls).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("without an idempotency key nothing is deduplicated")
+    void withoutAKeyTheBehaviourIsUnchanged() {
+        tickets.detail = FakeTicketService.detail("t1", 1042, "incident", "new", "high", "打印机离线");
+        String token = callerToken("user-7", List.of("employee"));
+
+        invoke(token, "ticket_create", Map.of("title", "打印机离线"), null);
+        invoke(token, "ticket_create", Map.of("title", "打印机离线"), null);
+
+        assertThat(tickets.createCalls).isEqualTo(2);
+        assertThat(idempotencyRows.insertAttempts.get()).isZero();
+    }
+
+    @Test
+    @DisplayName("a repeated read is not served from a cache")
+    void readsAreNotDeduplicated() {
+        String token = callerToken("user-7", List.of("employee"));
+
+        invoke(token, "ticket_list", Map.of(), "idem_read_1");
+        invoke(token, "ticket_list", Map.of(), "idem_read_1");
+
+        // A repeated list is supposed to show current data; a cached page would be worse than
+        // a duplicate query.
+        assertThat(tickets.listCalls).isEqualTo(2);
+        assertThat(idempotencyRows.insertAttempts.get()).isZero();
+    }
+
+    @Test
+    @DisplayName("a failed write is not recorded, so the retry is not deduplicated")
+    void failuresAreNotRecorded() {
+        tickets.failure = new AuthException(TicketService.FORBIDDEN_TICKET_ACTION, "需要处理人权限");
+        String token = callerToken("user-7", List.of("employee"));
+
+        invoke(token, "ticket_create", Map.of("title", "越权尝试"), "idem_fail");
+        invoke(token, "ticket_create", Map.of("title", "越权尝试"), "idem_fail");
+
+        // Caching a refusal would make a transient failure permanent.
+        assertThat(idempotencyRows.insertAttempts.get()).isZero();
+        // Both attempts reached the ticket service (which refused), so the second delivery was
+        // not answered from a cache.
+        assertThat(tickets.createAttempts).isEqualTo(2);
     }
 
     @Test
@@ -311,6 +408,11 @@ class InternalToolControllerTest {
         private TicketService.MergeResult mergeResult;
         private String mergeSource;
         private String mergeTarget;
+        /** Counts of calls that changed state or read tickets, so deduplication is provable. */
+        private int createCalls;
+        /** Counts *attempts*, including the ones that were refused. */
+        private int createAttempts;
+        private int listCalls;
 
         FakeTicketService() {
             super(null, null, null, null, null);
@@ -350,9 +452,11 @@ class InternalToolControllerTest {
                 String urgency, String requestedPriority, String assigneeId, String parentId,
                 String requesterId, String source, String conversationId
         ) {
+            createAttempts += 1;
             if (failure != null) {
                 throw failure;
             }
+            createCalls += 1;
             lastCaller = caller;
             lastSource = source;
             lastPriorityOverride = requestedPriority;
@@ -377,6 +481,7 @@ class InternalToolControllerTest {
             if (failure != null) {
                 throw failure;
             }
+            listCalls += 1;
             lastCaller = caller;
             lastRequester = requesterId;
             lastQuery = query;

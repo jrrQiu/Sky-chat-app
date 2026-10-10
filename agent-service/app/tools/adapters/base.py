@@ -12,7 +12,7 @@ import httpx
 
 from app.config import settings
 from app.registry.registry import list_agents
-from app.tools.adapters.contract import ToolAdapter
+from app.tools.adapters.contract import ToolAdapter, current_idempotency_key
 from app.tools.adapters.ticket import TICKET_TOOLS, TicketToolAdapter
 from app.tools.catalog import TOOLS
 
@@ -52,7 +52,10 @@ class OpenApiToolAdapter(ToolAdapter):
 
         headers = {
             "X-User-ID": str(state.get("user_id") or ""),
-            "Idempotency-Key": str(args.get("idempotency_key") or ""),
+            # T3: the same key the first-party adapter sends, taken from the same place.
+            "Idempotency-Key": str(
+                args.get("idempotency_key") or current_idempotency_key() or ""
+            ),
             "Content-Type": "application/json",
         }
         if settings.tool_api_token:

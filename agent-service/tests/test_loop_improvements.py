@@ -29,6 +29,17 @@ from app.tools.calling import ModelTurn, ToolChoice, converse_stream
 from app.tools.catalog import TOOLS, openai_tools
 
 
+@pytest.fixture(autouse=True)
+def _writes_are_not_suspended(monkeypatch):
+    """Run the confirm tier as `direct` in this file.
+
+    Writes here are about the loop (ordering, replay safety, stopping after a write), not about
+    pausing for confirmation -- that path has its own coverage in ``test_write_confirmation.py``.
+    """
+    monkeypatch.setattr(settings, "write_confirmation_enabled", False, raising=False)
+    yield
+
+
 def state(**overrides):
     value = {
         "request_id": "req-1",
@@ -278,11 +289,19 @@ async def test_the_loop_stops_when_the_token_budget_is_spent(monkeypatch):
     _results, _mode, rounds, accounting = result
     assert accounting["stopReason"] == "TOKEN_BUDGET"
     assert accounting["tokens"] == 1000
-    assert rounds == 1
+    # The budget is checked before the round executes, so the round it refused to pay for is
+    # not counted. Stopping *before* spending is the point of checking here rather than after.
+    assert rounds == 0
 
 
 @pytest.mark.asyncio
-async def test_accounting_reports_no_token_figure_when_none_was_reported(monkeypatch):
+async def test_accounting_estimates_tokens_when_the_provider_reports_none(monkeypatch):
+    """An unreported figure is estimated, never treated as zero.
+
+    Reporting "no tokens" was how a provider that omits ``usage`` silently disabled the token
+    budget: the running total stayed at 0, so ``agent_token_budget`` could never fire. The loop
+    now measures with the same tokenizer the context engine uses and labels the result estimated.
+    """
     adapter = ConcurrencyAdapter()
     monkeypatch.setattr(tools_node, "get_tool_adapter", lambda: adapter)
     monkeypatch.setattr(
@@ -291,7 +310,8 @@ async def test_accounting_reports_no_token_figure_when_none_was_reported(monkeyp
 
     _results, _mode, _rounds, accounting = await tools_node.run_tool_loop(state())
 
-    assert accounting["tokens"] is None
+    assert accounting["tokens"] and accounting["tokens"] > 0
+    assert accounting["usageSource"] == "estimated"
 
 
 def always(*calls) -> ModelTurn:

@@ -236,7 +236,12 @@ class MetricsRegistry:
         help_text: str = "",
         **labels: object,
     ) -> Counter:
-        """Return a counter handle. Reuse the same label names for one metric."""
+        """Return a counter handle. Reuse the same label names for one metric.
+
+        ``name`` is taken by the metric name itself, so a label may not be called ``name``:
+        ``counter("x", "help", name="y")`` raises ``TypeError`` rather than recording
+        something surprising. Use a specific label instead (``call``, ``tool``, ``model``, …).
+        """
         declared = self._declare(name, COUNTER, help_text, labels)
         return Counter(self, name, declared)
 

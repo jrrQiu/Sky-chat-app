@@ -9,8 +9,13 @@
 
 import { useParams } from 'react-router-dom'
 import { useChatStore } from '@/features/chat/store/chat.store'
-import { selectMessagePhase, selectIsProcessing } from '@/features/chat/store/selectors'
+import {
+  selectMessagePhase,
+  selectIsProcessing,
+  selectMessageError,
+} from '@/features/chat/store/selectors'
 import { ChatService } from '@/features/chat/services/chat.service'
+import { focusComposer } from '@/features/chat/utils/focus-composer'
 import { ChatMessageUI } from './ChatMessageUI'
 
 interface ChatMessageProps {
@@ -29,6 +34,7 @@ export function ChatMessage({ messageId }: ChatMessageProps) {
   // 状态机数据
   const phase = useChatStore(selectMessagePhase(messageId))
   const isProcessing = useChatStore(selectIsProcessing(messageId))
+  const errorMessage = useChatStore(selectMessageError(messageId))
 
   if (!message) return null
 
@@ -55,6 +61,13 @@ export function ChatMessage({ messageId }: ChatMessageProps) {
       }
     : undefined
 
+  // "去补充"只在最后一轮、且当前没有在发送时给出：卡片会留在历史里（那是真实的问答记录），
+  // 但一个指向过去的可点按钮只会让人误以为还能补充上一轮。
+  const handleFocusInput =
+    message.clarification && isLastMessage && !isSendingMessage
+      ? () => focusComposer()
+      : undefined
+
   return (
     <ChatMessageUI
       message={message}
@@ -62,9 +75,11 @@ export function ChatMessage({ messageId }: ChatMessageProps) {
       phase={phase}
       isProcessing={isProcessing}
       isWaitingForResponse={isWaitingForResponse}
+      errorMessage={errorMessage}
       onRetry={handleRetry}
       onResume={handleResume}
       onCancelTool={handleCancelTool}
+      onFocusInput={handleFocusInput}
     />
   )
 }

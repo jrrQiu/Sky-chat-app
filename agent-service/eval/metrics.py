@@ -50,6 +50,28 @@ METRIC_EVAL_CITATIONS = "eval.citation_checks"
 HELP_EVAL_CITATIONS = "Citation resolution checks, by result."
 
 
+def unique_in_order(items: list[str]) -> list[str]:
+    """Collapse to distinct ids, keeping first-occurrence order.
+
+    The golden set labels *documents*, but the retriever returns *chunks*, and since
+    chunk-level evidence is no longer collapsed to one block per document the same
+    document can legitimately appear several times. Recall, MRR and nDCG are
+    document-level measures with a ceiling of 1.0 and an ideal ranking of distinct
+    labels, so feeding them a list with repeats counts one document as several hits
+    — which produced `recall_at_k = 1.7` on the golden set, a score that cannot
+    exist. Deduplicating first restores the documented semantics without throwing
+    away the extra chunks, which the prompt legitimately wants.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
 def precision_at_k(relevant: set[str], retrieved: list[str], k: int) -> float:
     top = retrieved[:k]
     if not top:
@@ -206,6 +228,83 @@ def citation_accuracy_for_query(
     return statistics.mean(scores), checks
 
 
+# ----------------------------------------------------- context citation map
+
+#: Why a context-level citation check failed, when it did.
+REASON_MAP_NOT_CONTIGUOUS = "citation numbers are not contiguous from 1"
+REASON_MARKER_MISSING = "a mapped number does not appear in the rendered prompt"
+REASON_SOURCE_ABSENT = "a mapped source id is not in the evidence actually kept"
+
+
+def check_context_citation_map(
+    citation_map: dict[str, str] | None,
+    rendered_prompt: str,
+    kept_source_ids: Iterable[str],
+) -> tuple[float, list[dict[str, Any]]]:
+    """Verify the engine's citation map against what it actually rendered.
+
+    This is the budget-side half of citation accuracy. The retrieval-side check in
+    `citation_accuracy_for_query` grades the *evidence*; this one grades the
+    *prompt the model was given*, which is where the old engine's defect lived:
+    evidence was numbered before trimming, so a citation could name a `[3]` that
+    had been cut and no longer existed anywhere in the prompt.
+
+    Returns ``(score, details)`` where the score is the share of mapped citations
+    that resolve. An empty map scores 1.0: nothing was cited, so nothing can
+    dangle.
+    """
+    citation_map = citation_map or {}
+    kept = {str(item) for item in kept_source_ids if str(item)}
+    details: list[dict[str, Any]] = []
+
+    if not citation_map:
+        return 1.0, details
+
+    numbers = sorted(int(key) for key in citation_map if str(key).isdigit())
+    contiguous = numbers == list(range(1, len(numbers) + 1))
+    if not contiguous:
+        details.append(
+            {
+                "number": "",
+                "source_id": "",
+                "resolved": False,
+                "reason": REASON_MAP_NOT_CONTIGUOUS,
+            }
+        )
+
+    resolved = 0
+    for key, source_id in sorted(
+        citation_map.items(), key=lambda item: int(item[0]) if item[0].isdigit() else 0
+    ):
+        number = str(key)
+        if not contiguous:
+            break
+        if f"[{number}]" not in rendered_prompt:
+            details.append(
+                {
+                    "number": number,
+                    "source_id": str(source_id),
+                    "resolved": False,
+                    "reason": REASON_MARKER_MISSING,
+                }
+            )
+            continue
+        if kept and str(source_id) not in kept:
+            details.append(
+                {
+                    "number": number,
+                    "source_id": str(source_id),
+                    "resolved": False,
+                    "reason": REASON_SOURCE_ABSENT,
+                }
+            )
+            continue
+        resolved += 1
+
+    total = len(numbers) if contiguous else len(numbers) + 1
+    return (resolved / total if total else 1.0), details
+
+
 # --------------------------------------------------------------- groundedness
 
 #: The judge protocol. Returning `None` means "could not judge", which the
@@ -237,6 +336,10 @@ class EvaluationReport:
     groundedness_judge: str = ""
     #: Per-item citation resolution detail for the failing cases.
     citation_details: list[dict[str, Any]] = field(default_factory=list)
+    #: Citation-map integrity of the assembled prompt. `None` when the harness was
+    #: not given an assembled context to check (this is the retrieval-only path).
+    context_citation_accuracy: float | None = None
+    context_citation_details: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def citation_failures(self) -> list[dict[str, Any]]:
@@ -279,7 +382,10 @@ def evaluate_retrieval(
     ``eval.judge.build_llm_judge()`` to measure it for real.
 
     `answer_fn` is an optional hook returning the generated answer for a query
-    so its ``[n]`` citation markers can be graded as well as the evidence.
+    so its ``[n]`` citation markers can be graded as well as the evidence. It may
+    instead return ``(answer, assembled_context)`` — an object with ``system``,
+    ``citation_map`` and ``kept_evidence`` — in which case the assembled prompt's
+    citation map is graded too (``context_citation_accuracy``).
     """
     recall_scores: list[float] = []
     mrr_scores: list[float] = []
@@ -289,13 +395,17 @@ def evaluate_retrieval(
     grounded_scores: list[float] = []
     details: list[dict[str, Any]] = []
     citation_details: list[dict[str, Any]] = []
+    context_citation_scores: list[float] = []
+    context_citation_details: list[dict[str, Any]] = []
     latencies: list[float] = []
     judge_requested = judge is not None
     evidence_items_seen = 0
 
     for golden in golden_queries:
         result = run_fn(golden.query)
-        retrieved = [item["source_id"] for item in result.evidence]
+        # Distinct documents, in rank order: several evidence blocks may legitimately
+        # cite the same document, but the metrics below are document-level.
+        retrieved = unique_in_order([item["source_id"] for item in result.evidence])
         relevant = set(golden.relevant)
         evidence_items_seen += len(result.evidence)
 
@@ -304,7 +414,15 @@ def evaluate_retrieval(
         ndcg_scores.append(ndcg_at_k(relevant, retrieved, k))
         precision_scores.append(precision_at_k(relevant, retrieved, k))
 
-        answer = answer_fn(golden, result) if answer_fn is not None else None
+        answer = None
+        assembled = None
+        if answer_fn is not None:
+            produced = answer_fn(golden, result)
+            if isinstance(produced, tuple):
+                answer, assembled = produced
+            else:
+                answer = produced
+
         query_score, checks = citation_accuracy_for_query(
             result.evidence, retrieved, answer=answer
         )
@@ -325,6 +443,27 @@ def evaluate_retrieval(
                 citation_details.append(
                     {"query": golden.query, **check.to_dict()}
                 )
+
+        if assembled is not None:
+            context_score, context_checks = check_context_citation_map(
+                getattr(assembled, "citation_map", None),
+                getattr(assembled, "system", ""),
+                [
+                    str(item.get("source_id"))
+                    for item in getattr(assembled, "kept_evidence", []) or []
+                ],
+            )
+            context_citation_scores.append(context_score)
+            for check in context_checks:
+                metrics.counter(
+                    METRIC_EVAL_CITATIONS,
+                    HELP_EVAL_CITATIONS,
+                    result="context_resolved" if check["resolved"] else "context_unresolved",
+                ).inc()
+                if not check["resolved"]:
+                    context_citation_details.append(
+                        {"query": golden.query, **check}
+                    )
 
         if judge is not None:
             judged = judge(golden.query, result.evidence)
@@ -371,4 +510,10 @@ def evaluate_retrieval(
         groundedness_reason=groundedness_reason,
         groundedness_judge=_judge_name(judge) if judge_requested else "",
         citation_details=citation_details,
+        context_citation_accuracy=(
+            statistics.mean(context_citation_scores)
+            if context_citation_scores
+            else None
+        ),
+        context_citation_details=context_citation_details,
     )

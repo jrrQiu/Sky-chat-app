@@ -20,6 +20,7 @@ arguments are built here and that fact is reported in ``/ready`` as
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Callable
 
@@ -28,6 +29,14 @@ import httpx
 from app.config import settings
 from app.core.internal_token import CallerTokenUnavailable, mint_java_caller_token
 from app.tools.adapters.base import ToolAdapter
+from app.tools.adapters.contract import current_idempotency_key
+from app.tools.resilience import (
+    RETRYABLE_STATUS_CODES,
+    call_with_retry,
+    policy_for_tool,
+)
+
+logger = logging.getLogger(__name__)
 
 #: Tools this adapter serves. Everything else still resolves to the mock adapter.
 TICKET_TOOLS = (
@@ -52,6 +61,21 @@ class MergeTargetsMissing(ValueError):
     Raised while building the arguments and converted into a normal failure result: a request
     the user can fix is not an exception, it is an answer.
     """
+
+class ToolHttpStatus(RuntimeError):
+    """A retryable HTTP status, raised so ``call_with_retry`` can classify it.
+
+    httpx does not raise for 4xx/5xx, so returning the response unchanged meant the retry
+    policy's status branch could never fire: a 429 or a 503 looked like a successful call and
+    surfaced as an immediate failure. A read may repeat safely, so it raises; a write must not
+    repeat once the request has landed (the effect is unknown), so its status is still returned
+    and reported as a failure.
+    """
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"tool returned a retryable status {status_code}")
+        self.status_code = status_code
+
 
 _MAX_TITLE = 120
 _MAX_DESCRIPTION = 2000
@@ -118,10 +142,41 @@ class TicketToolAdapter(ToolAdapter):
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        # T3: the ledger's provider key travels with the write so a duplicate delivery can be
+        # recognised on the Java side instead of creating a second ticket. Sent for reads too
+        # -- it costs one header and makes a retried read identifiable in the audit trail.
+        idempotency_key = str(args.get("idempotency_key") or current_idempotency_key() or "")
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
 
-        try:
+        from app.tools.catalog import TOOLS
+
+        spec = TOOLS.get(tool_name)
+        writes = bool(spec and spec.writes)
+        policy = policy_for_tool(writes=writes)
+
+        async def attempt() -> httpx.Response:
             async with self._client() as client:
                 response = await client.post(url, headers=headers, json=payload)
+            if not writes and response.status_code in RETRYABLE_STATUS_CODES:
+                # Only reads may repeat. A write whose request already landed has an unknown
+                # effect, so it is never retried (T1) and is reported as a failure below.
+                raise ToolHttpStatus(response.status_code)
+            return response
+
+        try:
+            outcome = await call_with_retry(
+                attempt, policy, name=f"tool.{tool_name}"
+            )
+            response = outcome.value
+        except ToolHttpStatus as error:
+            # The status was retryable and retrying is exhausted: the dependency is answering
+            # with it consistently. Reported as a failure with the status, never as success.
+            return _failure(
+                f"工单服务暂时不可用（HTTP {error.status_code}，已重试 "
+                f"{settings.tool_retry_read_attempts} 次），该操作未执行",
+                TICKET_SERVICE_UNAVAILABLE,
+            )
         except httpx.HTTPError as error:
             # Reported as a tool failure with a clear reason. Never a fabricated success.
             return _failure(
@@ -135,6 +190,22 @@ class TicketToolAdapter(ToolAdapter):
                 "INVALID_INTERNAL_CALLER",
             )
         if response.status_code >= 400:
+            # A 4xx is not the dependency failing: it answered, and it said our request was
+            # wrong. Collapsing 400/404/409/422 into one "service error" code had two costs --
+            # the caller could not tell a fixable request from an outage, and because the code
+            # was classified as transport, a caller bug could open the circuit breaker.
+            detail = _server_message(response)
+            if response.status_code == 404:
+                return _failure(
+                    detail or "工单服务中没有找到目标对象（HTTP 404），编号可能不存在。",
+                    "TOOL_TARGET_NOT_FOUND",
+                )
+            if response.status_code < 500 and response.status_code != 429:
+                return _failure(
+                    detail
+                    or f"工单服务拒绝了本次请求（HTTP {response.status_code}），参数需要调整。",
+                    "TOOL_REQUEST_REJECTED",
+                )
             return _failure(
                 f"工单服务返回 {response.status_code}，该操作未执行",
                 "TICKET_SERVICE_ERROR",
@@ -148,6 +219,11 @@ class TicketToolAdapter(ToolAdapter):
         if not isinstance(body, dict):
             return _failure("工单服务返回了非预期的响应结构", "TICKET_SERVICE_ERROR")
         body.setdefault("success", False)
+        if outcome.attempts > 1:
+            # Retries are visible: a dependency that needed three tries is degrading, and
+            # hiding that behind a normal-looking result is how it goes unnoticed.
+            body["attempts"] = outcome.attempts
+            body["retryReasons"] = outcome.retry_reasons
         return body
 
     def _client(self) -> httpx.AsyncClient:
@@ -262,6 +338,26 @@ def _truncate(value: str, limit: int) -> str:
 
 def _without_none(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
+
+
+def _server_message(response: httpx.Response) -> str:
+    """The dependency's own explanation for a rejected request, when it gave one.
+
+    Java answers a rejection with ``{"error": "..."}``. Passing that through is what makes slot
+    filling possible at all: "该工单已关闭，不能合并" is something a user can act on, while
+    "HTTP 409" is not.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    for key in ("error", "message", "detail"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:500]
+    return ""
 
 
 def _failure(text: str, code: str) -> dict[str, Any]:

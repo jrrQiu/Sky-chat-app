@@ -21,7 +21,21 @@ user will be told something happened.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+#: How a state-changing tool may be invoked. Declared per tool rather than derived from
+#: `approval_gated`, because "it was not marked as needing approval" is not a decision --
+#: it is the absence of one, and that is how the agent came to create tickets and post
+#: public comments on a user's behalf with no confirmation step at all.
+#:
+#: * ``direct``   — the caller's own permission is the whole authorisation.
+#: * ``confirm``  — one explicit user confirmation per call, via a graph interrupt.
+#: * ``approval`` — a separate approver's decision, via the existing approval engine.
+WritePolicy = Literal["direct", "confirm", "approval"]
+
+WRITE_DIRECT: WritePolicy = "direct"
+WRITE_CONFIRM: WritePolicy = "confirm"
+WRITE_APPROVAL: WritePolicy = "approval"
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,17 @@ class ToolSpec:
     approval_gated: bool = False
     #: Whether the tool changes state. Used for reporting, not for authorization.
     writes: bool = False
+    #: Which authorisation tier a write needs. Read-only tools leave it at `direct`, where
+    #: it is not consulted.
+    write_policy: WritePolicy = WRITE_DIRECT
+    #: Dot-paths a *successful* result must contain, e.g. ``("data.number",)``. A tool that
+    #: reports success without them is rewritten into a failure, so the model cannot take a
+    #: success-shaped result with no ticket number and invent the number from context.
+    result_required: tuple[str, ...] = ()
+    #: Keys of the result's ``data`` object that may be echoed back into the model context.
+    #: Everything else is dropped: a third-party system must not be able to pour an
+    #: arbitrary structure into the prompt.
+    result_data_fields: tuple[str, ...] = ()
 
 
 TOOLS: dict[str, ToolSpec] = {
@@ -58,6 +83,12 @@ TOOLS: dict[str, ToolSpec] = {
         required=("title",),
         permission="ticket:create",
         writes=True,
+        # Creating a ticket notifies other people and occupies a queue, so it asks once.
+        write_policy=WRITE_CONFIRM,
+        # Success without a number is not a success we can report: this is the contract
+        # that stops the model from filling in a plausible ticket number.
+        result_required=("data.number",),
+        result_data_fields=("id", "number", "type", "status", "priority", "title"),
     ),
     "ticket_list": ToolSpec(
         name="ticket_list",
@@ -97,6 +128,11 @@ TOOLS: dict[str, ToolSpec] = {
         required=("body",),
         permission="ticket:comment",
         writes=True,
+        # Speaking in the user's name on a public thread cannot be taken back, so it asks
+        # once per call.
+        write_policy=WRITE_CONFIRM,
+        result_required=("data.number",),
+        result_data_fields=("id", "number", "status", "commentCount"),
     ),
     "ticket_merge": ToolSpec(
         name="ticket_merge",
@@ -113,6 +149,10 @@ TOOLS: dict[str, ToolSpec] = {
         permission="ticket:merge",
         approval_gated=True,
         writes=True,
+        # Irreversible: the source ticket stops existing as an independent entity.
+        write_policy=WRITE_APPROVAL,
+        result_required=("data.source.number", "data.target.number"),
+        result_data_fields=("source", "target"),
     ),
 }
 
@@ -135,6 +175,43 @@ def direct_tools() -> list[str]:
 
 def approval_gated_tools() -> list[str]:
     return [name for name, spec in TOOLS.items() if spec.approval_gated]
+
+
+def confirm_tools() -> list[str]:
+    """Tools that pause for one explicit user confirmation."""
+    return [
+        name
+        for name, spec in TOOLS.items()
+        if spec.writes and spec.write_policy == WRITE_CONFIRM
+    ]
+
+
+def write_policy_for(name: str) -> WritePolicy:
+    """The authorisation tier for a tool. Unknown tools are treated as the strictest."""
+    spec = TOOLS.get(name)
+    if spec is None:
+        return WRITE_APPROVAL
+    return spec.write_policy if spec.writes else WRITE_DIRECT
+
+
+def result_contract(name: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(required dot-paths, allowed data fields)`` for a tool's result."""
+    spec = TOOLS.get(name)
+    if spec is None:
+        return (), ()
+    return spec.result_required, spec.result_data_fields
+
+
+def dig(value: Any, path: str) -> Any:
+    """Read a dot-path out of a nested mapping, or return ``None``."""
+    current: Any = value
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
 
 
 def openai_schema(name: str) -> dict[str, Any]:
@@ -169,9 +246,14 @@ def catalog_status() -> dict[str, Any]:
                 "permission": spec.permission,
                 "writes": spec.writes,
                 "approvalGated": spec.approval_gated,
+                # The authorisation tier is reported per tool: "the agent can write" is
+                # not a useful statement, "which writes need what" is.
+                "writePolicy": spec.write_policy,
+                "resultRequired": list(spec.result_required),
             }
             for spec in TOOLS.values()
         ],
         "approvalGated": approval_gated_tools(),
+        "confirmGated": confirm_tools(),
         "modelCallable": direct_tools(),
     }

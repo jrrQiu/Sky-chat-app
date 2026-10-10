@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -41,7 +42,14 @@ async def retrieve_knowledge(
         if settings.retrieval_use_llm or settings.retrieval_use_postgres
         else None
     )
-    result = run_retrieval(
+    # `run_retrieval` is synchronous and does real I/O: a database read to build the
+    # index, a vector search, and embedding calls. Awaiting it directly would run all
+    # of that *on* the event loop, stalling every other in-flight request for the
+    # duration — the failure mode is not "this request is slow" but "all requests are".
+    # The retrieval layer stays synchronous (it is also called from non-async code);
+    # it is moved to a worker thread here instead.
+    result = await asyncio.to_thread(
+        run_retrieval,
         query,
         user_context=user_context,
         query_client=query_client,

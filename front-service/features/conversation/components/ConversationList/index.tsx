@@ -26,12 +26,18 @@ export function ConversationList() {
   // 处理删除逻辑
   const handleDelete = async (id: string) => {
     if (!window.confirm('确定要删除这个会话吗？历史记录将不可恢复。')) return
-    
+
+    // 先算出删除后要去哪：删掉当前会话就把用户扔回落地页（旧行为 navigate('/')）等于
+    // 把上下文也一起删了。留在会话区更合理 —— 优先进入相邻的会话，列表空了才回到
+    // /chat（它会复用最近会话，没有才新建）。
+    const remaining = conversations.filter((conv) => conv.id !== id)
+    const wasCurrent = currentId === id
+
     await deleteConversation(id)
-    
-    if (currentId === id) {
-      navigate('/')
-    }
+
+    if (!wasCurrent) return
+    const next = remaining[0]
+    navigate(next ? `/chat/${next.id}` : '/chat', { replace: true })
   }
 
   if (isLoading && !hasInitiallyLoaded) {

@@ -12,11 +12,11 @@ import { ThinkingPanel } from '@/features/chat/components/ThinkingPanel'
 import { MessageContent } from '@/features/chat/components/MessageContent'
 import { MessageActions } from '@/features/chat/components/MessageActions'
 import { Button } from '@/components/ui/button'
-import { Loader2, Edit2, RotateCw, ChevronDown, ChevronRight, Globe, XCircle } from 'lucide-react'
+import { Loader2, Edit2, RotateCw, ChevronDown, ChevronRight, Globe, XCircle, HelpCircle } from 'lucide-react'
 import { MarkdownIcon } from '@/components/icons/MarkdownIcon'
 import { TextFileIcon } from '@/components/icons/TextFileIcon'
 import { cn } from '@/lib/utils'
-import type { Message, ToolInvocation, ToolResult, SearchSource } from '@/features/chat/types/chat'
+import type { Message, ToolInvocation, ToolResult, SearchSource, Clarification } from '@/features/chat/types/chat'
 import type { MessagePhase } from '@/features/chat/types/message-state'
 
 /**
@@ -202,16 +202,108 @@ function ToolResultItem({ result }: { result: ToolResult }) {
   return null
 }
 
+/**
+ * 工具名/字段名 → 中文标签。
+ *
+ * 服务端的 `missingFields` 在无法更精确时会给出工具名（例如 `ticket_get`）。把工具名直接
+ * 摆给用户（"需要：ticket_get"）等于没解释；未知字段原样显示，因为悄悄丢掉服务端给出的
+ * 线索比显示一个英文标识更糟。
+ */
+const CLARIFICATION_FIELD_LABELS: Record<string, string> = {
+  ticket_get: '工单编号',
+  ticket_list: '查询条件',
+  ticket_create: '工单内容',
+  ticket_comment: '回复内容',
+  ticket_merge: '待合并的两个工单编号',
+  number: '工单编号',
+  ticketId: '工单编号',
+  title: '标题',
+  body: '回复内容',
+}
+
+function fieldLabel(field: string): string {
+  return CLARIFICATION_FIELD_LABELS[field] || field
+}
+
+/**
+ * 槽位回填卡片：工具确定性失败后，服务端要求用户补充信息。
+ *
+ * 这张卡片是"提问"而不是"报错"——它不改 displayState，也不阻止用户继续输入；
+ * 用户的下一条消息就是回填。
+ */
+function ClarificationCard({
+  clarification,
+  onFocusInput,
+}: {
+  clarification: Clarification
+  onFocusInput?: () => void
+}) {
+  return (
+    <div className="space-y-2 rounded-2xl border border-amber-300/70 bg-amber-50/60 p-3.5 dark:border-amber-800/70 dark:bg-amber-950/20">
+      <div className="flex items-center gap-2 text-sm font-medium text-amber-800 dark:text-amber-300">
+        <HelpCircle className="h-4 w-4 shrink-0" />
+        <span>需要你补充信息后继续</span>
+      </div>
+      <p className="text-sm leading-relaxed whitespace-pre-wrap text-[hsl(var(--text-primary))]">
+        {clarification.question}
+      </p>
+      {clarification.missingFields.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-xs text-[hsl(var(--text-secondary))]">需要：</span>
+          {clarification.missingFields.map((field) => (
+            <span
+              key={field}
+              className="rounded-md bg-amber-100/80 px-2 py-0.5 text-xs text-amber-900 dark:bg-amber-900/30 dark:text-amber-200"
+            >
+              {fieldLabel(field)}
+            </span>
+          ))}
+        </div>
+      )}
+      {onFocusInput && (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onFocusInput}
+          className="h-7 px-2.5 text-xs"
+        >
+          去补充
+        </Button>
+      )}
+    </div>
+  )
+}
+
+/**
+ * 错误说明。
+ *
+ * 之前这里只有固定的"生成失败"，服务端的说明（"本次生成已有 120s 没有进展，请重试；
+ * 若刚才发生过写操作，请先确认结果再重试"）会在 store 里被丢掉 —— 而那句话正是用户
+ * 需要照做的部分。
+ */
+function MessageErrorBlock({ detail }: { detail?: string }) {
+  return (
+    <div className="flex items-start gap-2 text-red-500">
+      <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+      <span className="text-sm leading-relaxed whitespace-pre-wrap">{detail || '生成失败'}</span>
+    </div>
+  )
+}
+
 interface ChatMessageUIProps {
   message: Message
   messageId: string
   phase: MessagePhase
   isProcessing: boolean
   isWaitingForResponse: boolean
+  /** 服务端的错误说明；缺省时回退到通用文案。 */
+  errorMessage?: string
   onRetry?: () => void
   onResume?: () => void
   onEdit?: (newContent: string) => void
   onCancelTool?: (toolCallId: string) => void
+  /** 只在"这是最后一条消息且当前没有在发送"时给：否则会出现一个指向过去的、点了没用的按钮。 */
+  onFocusInput?: () => void
 }
 
 export function ChatMessageUI({
@@ -219,10 +311,12 @@ export function ChatMessageUI({
   messageId,
   phase,
   isProcessing,
+  errorMessage,
   onRetry,
   onResume,
   onEdit,
   onCancelTool,
+  onFocusInput,
 }: ChatMessageUIProps) {
   const isUser = message.role === 'user'
 
@@ -299,9 +393,10 @@ export function ChatMessageUI({
   const showWaitingIndicator = !isProcessing && !message.thinking && !message.content && message.displayState === 'waiting'
   const showInterruptedIndicator = message.displayState === 'interrupted'
   const showErrorIndicator =
-    !showInterruptedIndicator &&
-    (phase === 'error' || message.hasError) &&
-    !message.content
+    !showInterruptedIndicator && (phase === 'error' || Boolean(message.hasError))
+  // 有内容时错误说明要放在正文之后：正文是模型的输出，说明是"这一轮为什么没跑完"，
+  // 顺序反了会让用户先看到一个红条再看到答案。没有内容时它就占据指示器的位置。
+  const showErrorAfterContent = showErrorIndicator && Boolean(message.content)
 
   return (
     <div className="w-full py-6">
@@ -314,10 +409,8 @@ export function ChatMessageUI({
           </div>
         )}
 
-        {showErrorIndicator && (
-          <div className="flex items-center gap-2 text-red-500">
-            <span className="text-sm">生成失败</span>
-          </div>
+        {showErrorIndicator && !showErrorAfterContent && (
+          <MessageErrorBlock detail={errorMessage} />
         )}
 
         {showInterruptedIndicator && (
@@ -353,6 +446,14 @@ export function ChatMessageUI({
               isStreaming={isStreamingAnswer}
             />
           </div>
+        )}
+        {showErrorAfterContent && <MessageErrorBlock detail={errorMessage} />}
+        {/* 需要补充信息（槽位回填）：用户的下一条消息就是回填，所以这里只提示、不阻塞。 */}
+        {message.clarification && (
+          <ClarificationCard
+            clarification={message.clarification}
+            onFocusInput={onFocusInput}
+          />
         )}
         {/* 操作按钮区： */}
         {isStreaming && onRetry ? (

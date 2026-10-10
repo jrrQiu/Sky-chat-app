@@ -6,20 +6,24 @@ available. Treating dense as additive is deliberate: it used to replace the spar
 channel even when the "dense" provider was a hash stand-in, which fused noise into
 the ranking, and a provider that fails mid-run must not be able to empty the result
 set either.
+
+Dense retrieval itself is delegated to `app.retrieval.vector_store`: persisted
+vectors searched with a single ANN query when they exist, and an on-demand scan of
+the in-process index otherwise. Either way the channel is additive.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 
 from app.knowledge.models import KnowledgeChunk
 from app.knowledge.text import cosine_similarity, sparse_vector, tokenize
-from app.retrieval.embedding import dense_cosine_similarity
 from app.retrieval.fusion import reciprocal_rank_fusion
 from app.retrieval.rerank import rerank_policy_chunks
 from app.retrieval.types import RetrievalIndex, ScoredItem
+from app.retrieval.vector_store import DenseStore, InMemoryDenseStore
 
 logger = logging.getLogger(__name__)
 
@@ -78,40 +82,30 @@ def dense_rank(
     chunks: list[KnowledgeChunk],
     top_k: int,
     embedding_provider,
+    store: DenseStore | None = None,
 ) -> list[ScoredItem]:
     """Dense (semantic) channel, or nothing when it cannot contribute.
 
     An empty return means "no dense results", never "no results": the caller keeps
     the lexical channels, so a provider that is absent, misconfigured or failing
     degrades the run instead of wiping it out.
+
+    `store` selects the backend (persisted pgvector vectors vs. an on-demand scan);
+    without one the in-process scan is used, which is what the seed corpus and the
+    tests exercise.
     """
     if embedding_provider is None:
         return []
 
-    query_embedding = embedding_provider.embed(query)
-    if not query_embedding:
-        logger.warning(
-            "Dense embedding provider returned no vector for the query; "
-            "this retrieval run is lexical-only"
-        )
-        return []
-
-    ranked: list[ScoredItem] = []
-    for chunk in chunks:
-        chunk_embedding = embedding_provider.embed(chunk.content)
-        if not chunk_embedding:
-            continue
-        score = dense_cosine_similarity(query_embedding, chunk_embedding)
-        if score > 0:
-            ranked.append(ScoredItem(item=chunk, score=score, matched_by="vector"))
-
-    if not ranked:
-        logger.warning(
-            "Dense channel produced no candidate above zero similarity; "
-            "this retrieval run is lexical-only"
-        )
-    ranked.sort(key=lambda candidate: candidate.score, reverse=True)
-    return ranked[:top_k]
+    backend = store or InMemoryDenseStore(chunks)
+    return backend.search_dense(
+        query,
+        # Restrict to the chunks the caller already scoped (kb filter, status), so
+        # the dense channel ranks the same candidate set as the lexical ones.
+        allowed_chunk_ids={chunk.id for chunk in chunks},
+        top_k=top_k,
+        provider=embedding_provider,
+    )
 
 
 def sparse_rank(
@@ -168,6 +162,7 @@ def hybrid_retrieve_chunks(
     top_k: int = 8,
     rerank_client=None,
     embedding_provider=None,
+    dense_store: DenseStore | None = None,
 ) -> list[ScoredItem]:
     allowed_documents = {
         document.id
@@ -190,7 +185,13 @@ def hybrid_retrieve_chunks(
     # sees an empty dense list and still ranks the lexical candidates.
     if embedding_provider is not None:
         ranked_lists.append(
-            dense_rank(query, chunks, top_k=50, embedding_provider=embedding_provider)
+            dense_rank(
+                query,
+                chunks,
+                top_k=50,
+                embedding_provider=embedding_provider,
+                store=dense_store,
+            )
         )
 
     fused = reciprocal_rank_fusion(ranked_lists, k=60)

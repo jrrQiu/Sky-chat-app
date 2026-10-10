@@ -53,6 +53,9 @@ KNOWN_METRICS = (
     "citation_accuracy",
     "groundedness",
     "p95_latency_ms",
+    # Integrity of the assembled prompt's citation map. Measured only when the
+    # harness is given an assembled context, so it defaults to not-required.
+    "context_citation_accuracy",
 )
 
 MAX_MEASURED_METRICS = {
@@ -62,6 +65,7 @@ MAX_MEASURED_METRICS = {
     "precision_at_k",
     "citation_accuracy",
     "p95_latency_ms",
+    "context_citation_accuracy",
 }
 
 #: Defaults for the metrics that are always measured. `p95_latency_ms` is left
@@ -76,6 +80,9 @@ DEFAULT_THRESHOLDS: dict[str, dict[str, Any]] = {
     # Optional by default: measuring it needs a judge. `--require groundedness`
     # turns a missing judgement into a failure.
     "groundedness": {"min": 0.7, "required": False},
+    # A dangling citation in the assembled prompt is a hard defect, so the bar is
+    # 1.0 -- but it is only available on the context path, hence not required.
+    "context_citation_accuracy": {"min": 1.0, "required": False},
 }
 
 STATUS_PASS = "PASS"
@@ -323,6 +330,11 @@ def evaluate_gate(
 def _report_reason(report: EvaluationReport, name: str) -> str:
     if name == "groundedness":
         return report.groundedness_reason or "no reason recorded"
+    if name == "context_citation_accuracy":
+        return (
+            "no assembled context was supplied to the harness "
+            "(pass an answer_fn returning (answer, assembled_context) to measure it)"
+        )
     return "no reason recorded"
 
 

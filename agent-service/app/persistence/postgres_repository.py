@@ -1,6 +1,7 @@
 import asyncio
 import datetime as dt
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -543,6 +544,42 @@ class PostgresRepository:
                 )
                 row = await cur.fetchone()
         return dict(row) if row else None
+
+    async def claim_stale_effect(
+        self,
+        effect_key: str,
+        *,
+        lease_seconds: float,
+        provider_key: str | None = None,
+    ) -> bool:
+        """Take over a ``started`` row whose lease has expired. Single winner.
+
+        The staleness test uses the *database's* clock (``NOW() - lease``) rather than a
+        timestamp computed in Python: two replicas have two clocks, and the row's
+        ``updated_at`` is written by whichever replica ran the effect. Comparing against
+        ``NOW()`` keeps the judgement on one clock.
+
+        The compare-and-swap is what makes "only one owner" true: two replays both read the
+        same stale row, the first update moves ``updated_at`` past the threshold, and the
+        second matches zero rows. Same compare-and-swap style as ``approval_store.decide``,
+        for the same reason -- a write must have exactly one owner.
+        """
+        async with self._connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE effect_ledger
+                    SET attempts = attempts + 1,
+                        provider_key = COALESCE(%s, provider_key),
+                        updated_at = NOW()
+                    WHERE effect_key = %s
+                      AND status = 'started'
+                      AND updated_at < NOW() - make_interval(secs => %s)
+                    """,
+                    (provider_key, effect_key, float(lease_seconds)),
+                )
+                changed = cur.rowcount
+        return changed == 1
 
     async def finish_effect(
         self,

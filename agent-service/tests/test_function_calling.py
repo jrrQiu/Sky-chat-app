@@ -119,6 +119,19 @@ def _isolated_ledger(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _writes_are_not_suspended(monkeypatch):
+    """Run the confirm tier as `direct` in this file.
+
+    `ticket_create` is a `confirm`-tier write, so with the tier enabled the loop records a
+    pending confirmation and executes nothing. That is the correct behaviour and it is covered
+    end to end in ``test_write_confirmation.py``; leaving it on here would silently turn every
+    write assertion below into an assertion about the confirmation path.
+    """
+    monkeypatch.setattr(settings, "write_confirmation_enabled", False, raising=False)
+    yield
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     from app.tools.adapters.ticket import TicketToolAdapter

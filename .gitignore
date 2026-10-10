@@ -57,6 +57,11 @@ yarn-error.log*
 # local toolchains
 /.tools/
 
+# disposable build/verification workspace (javac output + live check scripts).
+# Not part of any build; the directory exists because this machine's Maven
+# `target/` directory is not writable under the current file policy.
+/.buildcheck/
+
 # runtime logs (agent-service writes these next to the app)
 *.log
 

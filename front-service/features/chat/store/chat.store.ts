@@ -199,6 +199,9 @@ export const useChatStore = create<ChatState & ChatActions>()((set, get) => ({
     newStates.set(messageId, {
       phase: nextPhase,
       activeTools: newActiveTools,
+      // 错误说明只属于错误阶段：任何一次新的流转都意味着这次失败已经过去，
+      // 否则"重试成功"之后界面上还挂着上一次的失败原因。
+      errorMessage: event.type === 'ERROR' ? event.message : undefined,
     })
     
     return { messageStates: newStates }

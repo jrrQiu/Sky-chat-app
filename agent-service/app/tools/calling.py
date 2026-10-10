@@ -18,6 +18,7 @@ Three deliberate constraints:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ import httpx
 
 from app.config import settings
 from app.tools.catalog import openai_tools
+from app.tools.resilience import call_with_retry, policy_for_model_turn
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +40,55 @@ SYSTEM_PROMPT = (
 )
 
 
+def function_calling_model() -> str:
+    """The model a tool-selection turn uses.
+
+    One resolver for the whole loop, so the model that chooses the tools and the model
+    that writes the answer are the same unless the caller deliberately overrides it. These
+    used to diverge: the tool turn read ``settings.deepseek_model`` while the answer used
+    ``state["model"]``, so a request could be priced and reasoned about as one model and
+    decided by another.
+    """
+    return (settings.function_calling_model or settings.deepseek_model or "").strip()
+
+
+#: The caller's model choice for the current turn. A context variable rather than a
+#: parameter so the existing call signatures (and their tests) stay unchanged, while the
+#: loop still gets to say which model answered.
+_model_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tool_calling_model", default=None
+)
+
+
+def model_override() -> str | None:
+    return _model_override.get()
+
+
+def set_model_override(model: str | None):
+    """Set the turn's model. Returns the token to pass to :func:`reset_model_override`."""
+    return _model_override.set((model or "").strip() or None)
+
+
+def reset_model_override(token) -> None:
+    _model_override.reset(token)
+
+
+def resolved_model() -> str:
+    return (model_override() or "").strip() or function_calling_model()
+
+
 class FunctionCallingUnavailable(RuntimeError):
-    """No usable model, so the caller should fall back to rules."""
+    """No usable model, so the caller should fall back to rules.
+
+    ``status_code`` carries the HTTP status when the provider answered with one. Without it a
+    429 looked like a deterministic refusal -- ``is_transient`` had nothing to classify, the
+    retry policy never fired, and a single rate-limit response silently degraded the turn to
+    rule-based tool selection instead of being retried.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -65,6 +114,12 @@ class ModelTurn:
     #: as well as by rounds; ``None`` means the provider did not say, which is reported rather
     #: than assumed to be zero.
     usage: dict[str, int] | None = None
+    #: How many attempts this turn took (1 = no retry) and why any retry happened. Kept on
+    #: the turn so the loop can report "the model needed two tries" instead of hiding it.
+    attempts: int = 1
+    retry_reasons: tuple[str, ...] = ()
+    #: True when the usage above is a local estimate because the provider reported none.
+    usage_estimated: bool = False
 
 
 def function_calling_enabled() -> bool:
@@ -127,28 +182,36 @@ async def converse(
     *,
     poster: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
 ) -> ModelTurn:
-    """One assistant turn given the whole conversation so far."""
+    """One assistant turn given the whole conversation so far.
+
+    Retried under the model-turn policy (T1/T2): the call is read-only in effect, so a 429,
+    a 5xx or a transport failure is worth one more attempt before the caller gives up and
+    falls back to rule-based selection. A deterministic 4xx is not retried.
+    """
     if not tool_names:
         return ModelTurn(calls=[], assistant_message={})
 
-    payload: dict[str, Any] = {
-        "model": settings.deepseek_model,
-        "messages": messages,
-        "tools": openai_tools(tool_names),
-        # `auto` on purpose: "answer directly" must remain an option, otherwise every turn would
-        # raise a ticket even when the user asked a question the assistant can answer.
-        "tool_choice": "auto",
-        "temperature": 0,
-    }
+    payload = _payload(messages, tool_names)
+    if not function_calling_enabled() and poster is None:
+        raise FunctionCallingUnavailable("no model configured for tool calling")
 
-    if poster is not None:
-        data = await poster(payload)
-    else:
-        if not function_calling_enabled():
-            raise FunctionCallingUnavailable("no model configured for tool calling")
-        data = await _post(payload)
+    async def attempt() -> dict[str, Any]:
+        if poster is not None:
+            return await poster(payload)
+        return await _post(payload)
 
-    return _parse_turn(data)
+    outcome = await call_with_retry(
+        attempt, policy_for_model_turn(), name="model.tool_choice"
+    )
+    turn = _parse_turn(outcome.value)
+    return ModelTurn(
+        calls=turn.calls,
+        assistant_message=turn.assistant_message,
+        content=turn.content,
+        usage=turn.usage,
+        attempts=outcome.attempts,
+        retry_reasons=tuple(outcome.reasons),
+    )
 
 
 async def converse_stream(
@@ -171,22 +234,28 @@ async def converse_stream(
     if not tool_names:
         return ModelTurn(calls=[], assistant_message={})
 
-    payload: dict[str, Any] = {
-        "model": settings.deepseek_model,
-        "messages": messages,
-        "tools": openai_tools(tool_names),
-        "tool_choice": "auto",
-        "temperature": 0,
-        "stream": True,
-        # Without this the streaming API omits usage entirely, and the loop could only be bounded
-        # by counting calls.
-        "stream_options": {"include_usage": True},
-    }
+    payload = _payload(messages, tool_names, stream=True)
 
+    attempts = 1
+    retry_reasons: tuple[str, ...] = ()
     if streamer is None:
         if not function_calling_enabled():
             raise FunctionCallingUnavailable("no model configured for tool calling")
-        streamer = _stream(payload)
+
+        # Retrying a *stream* is only safe before the first frame reaches the caller:
+        # once a delta has been forwarded, a second attempt would replay text the user
+        # has already seen. So the retry covers opening the connection and validating the
+        # response, and nothing after that.
+        opened = await call_with_retry(
+            lambda: _open_stream(messages, tool_names),
+            policy_for_model_turn(),
+            name="model.tool_choice_stream",
+        )
+        attempts = opened.attempts
+        retry_reasons = tuple(opened.reasons)
+        streamer = opened.value
+    elif streamer is None:  # pragma: no cover - unreachable, kept for clarity
+        raise FunctionCallingUnavailable("no streamer")
 
     content_parts: list[str] = []
     fragments: dict[int, dict[str, Any]] = {}
@@ -225,7 +294,15 @@ async def converse_stream(
                 slot["arguments"] += function["arguments"]
 
     content = "".join(content_parts) or None
-    return _turn_from_fragments(fragments, content, usage)
+    turn = _turn_from_fragments(fragments, content, usage)
+    return ModelTurn(
+        calls=turn.calls,
+        assistant_message=turn.assistant_message,
+        content=turn.content,
+        usage=turn.usage,
+        attempts=attempts,
+        retry_reasons=retry_reasons,
+    )
 
 
 def _turn_from_fragments(
@@ -290,7 +367,8 @@ async def _stream(payload: dict[str, Any]):
             if response.status_code >= 400:
                 body = await response.aread()
                 raise FunctionCallingUnavailable(
-                    f"tool calling failed with {response.status_code}: {body[:200]!r}"
+                    f"tool calling failed with {response.status_code}: {body[:200]!r}",
+                    status_code=response.status_code,
                 )
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
@@ -302,6 +380,96 @@ async def _stream(payload: dict[str, Any]):
                     yield json.loads(data)
                 except json.JSONDecodeError:
                     continue
+
+
+def _payload(
+    messages: list[dict[str, Any]],
+    tool_names: list[str],
+    *,
+    stream: bool = False,
+) -> dict[str, Any]:
+    """The request body for one tool-selection turn.
+
+    ``model`` comes from :func:`resolved_model`, so the turn that chooses tools and the turn
+    that writes the answer agree unless the caller said otherwise.
+    """
+    payload: dict[str, Any] = {
+        "model": resolved_model(),
+        "messages": messages,
+        "tools": openai_tools(tool_names),
+        # `auto` on purpose: "answer directly" must remain an option, otherwise every turn would
+        # raise a ticket even when the user asked a question the assistant can answer.
+        "tool_choice": "auto",
+        "temperature": 0,
+    }
+    if stream:
+        payload["stream"] = True
+        # Without this the streaming API omits usage entirely, and the loop could only be
+        # bounded by counting calls.
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+async def _open_stream(
+    messages: list[dict[str, Any]],
+    tool_names: list[str],
+) -> Callable[[dict[str, Any]], AsyncIterator[dict[str, Any]]]:
+    """Open the streaming connection and prove the model accepted the request.
+
+    Split out so the *retryable* part is exactly "connect and check the status": this
+    function is what :func:`call_with_retry` repeats. Iterating the body happens after,
+    where a failure can no longer be retried without replaying text to the user.
+    """
+    payload = _payload(messages, tool_names, stream=True)
+    client = httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
+    try:
+        request = client.build_request(
+            "POST",
+            _completion_url(),
+            headers=_auth_headers(),
+            json=payload,
+        )
+        response = await client.send(request, stream=True)
+        if response.status_code >= 400:
+            body = (await response.aread()).decode("utf-8", errors="replace")
+            await response.aclose()
+            raise FunctionCallingUnavailable(
+                f"tool calling failed with {response.status_code}: {body[:200]}",
+                status_code=response.status_code,
+            )
+    except Exception:
+        await client.aclose()
+        raise
+
+    async def iterate(_payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+        try:
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return iterate
+
+
+def _completion_url() -> str:
+    base = settings.deepseek_base_url.rstrip("/")
+    return base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+
+def _auth_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {settings.deepseek_api_key}",
+        "Content-Type": "application/json",
+    }
 
 
 def _usage(raw: dict[str, Any]) -> dict[str, int] | None:
@@ -316,24 +484,94 @@ def _usage(raw: dict[str, Any]) -> dict[str, int] | None:
 
 
 def total_tokens(*turns: ModelTurn) -> int:
-    return sum((turn.usage or {}).get("totalTokens", 0) for turn in turns)
+    """Tokens *added* by these turns.
+
+    Sums input + output rather than the provider's ``total_tokens``: with a growing prompt,
+    each turn's ``total_tokens`` already contains the previous turns' input, so adding them
+    together counts the same tokens several times and trips the budget early. Input and output
+    per turn are disjoint, so the sum is the real spend.
+    """
+    total = 0
+    for turn in turns:
+        usage = turn.usage or {}
+        total += int(usage.get("promptTokens") or 0) + int(usage.get("completionTokens") or 0)
+    return total
 
 
-def tool_result_message(call_id: str, result: dict[str, Any]) -> dict[str, Any]:
+def estimated_tokens(messages: list[dict[str, Any]]) -> int:
+    """Local token estimate for a message list, used when the provider reports no usage.
+
+    Delegates to the context engine's counter, so the loop and the prompt budget are metered
+    by the same tokenizer. Counting zero here (the old behaviour) made
+    ``agent_token_budget`` silently inert whenever the provider omitted ``usage``.
+    """
+    from app.context.tokenizer import count_messages
+
+    return count_messages(messages)
+
+
+def trim_result_text(text: str, max_tokens: int) -> tuple[str, bool]:
+    """Bound one tool result for the model, keeping both ends.
+
+    The full text is still emitted in the ``tool_result`` event, so trimming the copy that
+    goes into the prompt loses nothing an auditor needs -- it only stops "three rounds of a
+    20k-character result" from quietly consuming the window.
+    """
+    if max_tokens <= 0 or not text:
+        return text, False
+    from app.context.tokenizer import count_text
+    from app.context.truncate import truncate_text
+
+    if count_text(text) <= max_tokens:
+        return text, False
+    return truncate_text(text, max_tokens, "head_tail").text, True
+
+
+def tool_result_message(
+    call_id: str,
+    result: dict[str, Any],
+    *,
+    tool_name: str = "",
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
     """The `role: "tool"` reply for one call.
 
     Only the fields the model can act on are sent: whether it worked, the human-readable text,
-    the error code, and the data (which carries identifiers it may need next, such as a ticket
-    number).
+    the error code, and the whitelisted `data` fields (which carry identifiers it may need
+    next, such as a ticket number). The text is bounded by tokens (T6) and the data object is
+    projected through the catalog's field list, so a target system cannot pour an arbitrary
+    structure into the prompt.
     """
-    payload = {
+    from app.config import settings
+    from app.tools.catalog import result_contract
+
+    limit = settings.tool_result_max_tokens if max_tokens is None else max_tokens
+    text, trimmed = trim_result_text(str(result.get("text") or ""), limit)
+    payload: dict[str, Any] = {
         "success": bool(result.get("success")),
-        "text": str(result.get("text") or ""),
+        "text": text,
     }
     if result.get("error"):
         payload["error"] = result["error"]
-    if result.get("data") is not None:
-        payload["data"] = result["data"]
+        # The model-facing half of the failure contract: the code alone tells it
+        # nothing about whether the effect landed or what to do next, and inferring
+        # that is exactly the job this code is supposed to do instead.
+        try:
+            from app.tools.failures import advice_for
+
+            payload["advice"] = advice_for(str(result["error"])).to_dict()
+        except Exception:  # pragma: no cover - advice must never break a tool result
+            pass
+    data = result.get("data")
+    if isinstance(data, dict):
+        _, allowed = result_contract(tool_name)
+        if allowed:
+            payload["data"] = {key: data[key] for key in allowed if key in data}
+        elif not tool_name:
+            payload["data"] = data
+    if trimmed:
+        payload["textTruncated"] = True
+        payload["textOriginalChars"] = len(str(result.get("text") or ""))
     return {
         "role": "tool",
         "tool_call_id": call_id,
@@ -361,7 +599,8 @@ async def _post(payload: dict[str, Any]) -> dict[str, Any]:
     if response.status_code >= 400:
         # A model-side failure is the caller's cue to fall back, not an error for the user.
         raise FunctionCallingUnavailable(
-            f"tool calling failed with {response.status_code}: {response.text[:200]}"
+            f"tool calling failed with {response.status_code}: {response.text[:200]}",
+            status_code=response.status_code,
         )
     return response.json()
 

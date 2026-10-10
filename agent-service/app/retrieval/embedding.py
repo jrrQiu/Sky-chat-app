@@ -16,14 +16,23 @@ The contract is now explicit:
 * the dense channel is additive — `hybrid_search` always runs the lexical channels
   and only *adds* the dense one, so a missing or failing provider degrades recall
   rather than emptying the result.
+
+**Batching and the event loop.** Embedding used to be one synchronous HTTP request
+per chunk, issued from inside an `async` graph node. That is two defects at once:
+an N+1 call pattern (N chunks → N round trips per query) and a blocking call on the
+event loop, which stalls every other in-flight request. Providers therefore expose
+`embed_batch` (many texts, one request) and `aembed_batch` (the same, off the event
+loop). Persisting the vectors at ingest is what removes the per-query work
+entirely — see `app/retrieval/vector_store.py`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 import httpx
 
@@ -45,8 +54,27 @@ def _warn_once(key: str, message: str) -> None:
     logger.warning(message)
 
 
+@runtime_checkable
 class EmbeddingProvider(Protocol):
-    def embed(self, text: str) -> list[float]:
+    """Single-text embedding. Kept because callers and tests inject it directly."""
+
+    def embed(self, text: str) -> list[float] | None:
+        ...
+
+
+@runtime_checkable
+class BatchEmbeddingProvider(Protocol):
+    """Batch embedding, with an async variant that does not block the event loop.
+
+    `aembed_batch` is the method the request path must use. A provider that only
+    implements the synchronous pair is wrapped by `as_async_provider`, which moves
+    the call onto a worker thread rather than blocking the loop.
+    """
+
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
+        ...
+
+    async def aembed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
         ...
 
 
@@ -81,41 +109,174 @@ class HashEmbeddingProvider:
             return [value / norm for value in vector]
         return vector
 
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
+        return [self.embed(text) for text in texts]
+
+    async def aembed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
+        # Purely local arithmetic; no I/O to move off the loop.
+        return self.embed_batch(texts)
+
 
 class HttpEmbeddingProvider:
+    """OpenAI-compatible `/embeddings` client, batched and async-capable."""
+
     def __init__(
         self,
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
+        batch_size: int | None = None,
+        timeout: float | None = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else settings.embedding_api_key
         self.base_url = (base_url or settings.embedding_base_url).rstrip("/")
         self.model = model or settings.embedding_model
+        self.batch_size = max(1, batch_size or settings.embedding_batch_size)
+        self.timeout = timeout or settings.llm_timeout_seconds
 
     def _url(self) -> str:
         if self.base_url.endswith("/embeddings"):
             return self.base_url
         return f"{self.base_url}/embeddings"
 
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _order(response_json: dict[str, Any], expected: int) -> list[list[float] | None]:
+        """Map a response back to input order by `index`, not by list position.
+
+        Providers are not required to return embeddings in request order, and the
+        OpenAI-compatible contract carries an explicit `index` for exactly this
+        reason. Zipping positionally would silently attach the wrong vector to the
+        wrong chunk — a corruption that shows up as slightly-worse retrieval, never
+        as an error.
+        """
+        slots: list[list[float] | None] = [None] * expected
+        for item in response_json.get("data") or []:
+            index = item.get("index")
+            embedding = item.get("embedding")
+            if not isinstance(index, int) or not 0 <= index < expected:
+                continue
+            if isinstance(embedding, list) and embedding:
+                slots[index] = [float(value) for value in embedding]
+        return slots
+
     def embed(self, text: str) -> list[float] | None:
+        return self.embed_batch([text])[0]
+
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
         if not self.api_key:
-            return None
+            return [None] * len(texts)
+        results: list[list[float] | None] = []
+        for start in range(0, len(texts), self.batch_size):
+            window = list(texts[start : start + self.batch_size])
+            results.extend(self._embed_window(window))
+        return results
+
+    def _embed_window(self, window: list[str]) -> list[list[float] | None]:
+        if not window:
+            return []
         try:
             response = httpx.post(
                 self._url(),
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": self.model, "input": text},
-                timeout=settings.llm_timeout_seconds,
+                headers=self._headers(),
+                json={"model": self.model, "input": window},
+                timeout=self.timeout,
             )
             response.raise_for_status()
-            payload = response.json()
-            return list(payload["data"][0]["embedding"])
+            return self._order(response.json(), len(window))
         except Exception:
-            return None
+            # Never raise into the retrieval path: the caller treats `None` slots as
+            # "this chunk has no vector" and keeps the lexical channels.
+            logger.warning("Embedding request failed for %d text(s)", len(window), exc_info=True)
+            return [None] * len(window)
+
+    async def aembed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
+        if not self.api_key:
+            return [None] * len(texts)
+        results: list[list[float] | None] = []
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            for start in range(0, len(texts), self.batch_size):
+                window = list(texts[start : start + self.batch_size])
+                results.extend(await self._aembed_window(client, window))
+        return results
+
+    async def _aembed_window(
+        self,
+        client: httpx.AsyncClient,
+        window: list[str],
+    ) -> list[list[float] | None]:
+        if not window:
+            return []
+        try:
+            response = await client.post(
+                self._url(),
+                headers=self._headers(),
+                json={"model": self.model, "input": window},
+            )
+            response.raise_for_status()
+            return self._order(response.json(), len(window))
+        except Exception:
+            logger.warning(
+                "Async embedding request failed for %d text(s)", len(window), exc_info=True
+            )
+            return [None] * len(window)
+
+
+class _AsyncWrapper:
+    """Adapt a synchronous provider so the request path never blocks the loop."""
+
+    def __init__(self, provider: Any) -> None:
+        self._provider = provider
+
+    def embed(self, text: str) -> list[float] | None:
+        return self._provider.embed(text)
+
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
+        return _sync_batch(self._provider, texts)
+
+    async def aembed_batch(self, texts: Sequence[str]) -> list[list[float] | None]:
+        return await asyncio.to_thread(_sync_batch, self._provider, texts)
+
+
+def _sync_batch(provider: Any, texts: Sequence[str]) -> list[list[float] | None]:
+    """Call the best batch method a provider actually offers."""
+    batch = getattr(provider, "embed_batch", None)
+    if callable(batch):
+        return list(batch(texts))
+    return [provider.embed(text) for text in texts]
+
+
+def as_async_provider(provider: Any) -> Any:
+    """Guarantee `aembed_batch` without changing what the provider computes."""
+    if provider is None:
+        return None
+    if hasattr(provider, "aembed_batch"):
+        return provider
+    return _AsyncWrapper(provider)
+
+
+def embed_many(
+    texts: list[str],
+    provider: Any,
+) -> list[list[float] | None]:
+    """Batch helper kept for callers that want the synchronous path."""
+    return _sync_batch(provider, texts)
+
+
+async def aembed_many(
+    texts: Sequence[str],
+    provider: Any,
+) -> list[list[float] | None]:
+    """The request-path entry point: batched, and never blocking the event loop."""
+    wrapped = as_async_provider(provider)
+    if wrapped is None:
+        return [None] * len(texts)
+    return await wrapped.aembed_batch(texts)
 
 
 def default_embedding_provider() -> EmbeddingProvider | None:
@@ -168,14 +329,8 @@ def describe_dense_channel() -> dict[str, object]:
         "wired": wired,
         "hash_embeddings_enabled": bool(settings.allow_hash_embeddings),
         "model": settings.embedding_model if provider == "http" else None,
+        "batch_size": settings.embedding_batch_size if provider == "http" else None,
     }
-
-
-def embed_many(
-    texts: list[str],
-    provider: EmbeddingProvider,
-) -> list[list[float]]:
-    return [provider.embed(text) for text in texts]
 
 
 def dense_cosine_similarity(

@@ -18,8 +18,9 @@ const tutorialSteps: TutorialStep[] = [
     illustration: 'welcome',
   },
   {
-    title: '输入你的问题',
-    description: '在下方输入框中输入任何问题，可以是工作、学习、生活中的任何内容。',
+    title: '登录后开始对话',
+    description:
+      '点击「登录 / 注册」进入对话页，在页面底部的输入框里输入任何问题 —— 工作、学习、生活中的都可以。',
     illustration: 'input',
   },
   {
